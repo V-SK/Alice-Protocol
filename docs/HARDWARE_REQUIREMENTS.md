@@ -5,9 +5,12 @@
 | Profile | Requirement | Support Level | Expected Performance |
 |---|---|---|---|
 | CUDA GPU | `>= 24GB VRAM` | Recommended | Best performance |
-| Apple Silicon | `>= 24GB unified memory` | Supported | Good performance |
+| CUDA GPU | `16GB VRAM` | Supported, slower | `batch_size=1`, lower throughput |
+| Apple Silicon | `>= 32GB unified memory` | Recommended | Good performance |
+| Apple Silicon | `24GB unified memory` | Supported | Reduced throughput |
+| Apple Silicon | `16GB unified memory` | Supported, very slow | Uses macOS swap, `batch_size=1` |
 | CPU | `>= 32GB RAM` | Supported but not recommended | Roughly `1/50 - 1/100` of GPU throughput |
-| Low memory | `< 20GB VRAM / RAM` | Not supported | Likely unstable or unusable |
+| Low memory | `< 16GB VRAM / RAM` | Not supported | Likely unstable or unusable |
 
 ### CPU mining
 
@@ -17,6 +20,12 @@ CPU mining is supported but not recommended. Training speed is typically `50-100
 - much longer warm-up and model load time
 
 Minimum recommendation for CPU mining: `32GB RAM`.
+
+### Apple Silicon notes
+
+- `16GB` Apple Silicon is supported, but macOS will rely on swap and training will be very slow.
+- `24GB+` Apple Silicon is supported.
+- `32GB+` Apple Silicon is recommended.
 
 ## Scorer
 

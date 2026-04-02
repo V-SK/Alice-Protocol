@@ -80,9 +80,12 @@ It does **not** connect directly to the aggregator.
 ## 5. Hardware guidance
 
 - CUDA GPU `>= 24GB`: recommended
+- CUDA GPU `16GB`: supported, slower (`batch_size=1`)
+- Apple Silicon `16GB`: supported, very slow (macOS swap, `batch_size=1`)
 - Apple Silicon `>= 24GB`: supported
+- Apple Silicon `>= 32GB`: recommended
 - CPU `>= 32GB RAM`: supported but very slow
-- `< 20GB`: not supported
+- `< 16GB`: not supported
 
 CPU mining is supported but not recommended.
 

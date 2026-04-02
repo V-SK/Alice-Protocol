@@ -73,9 +73,12 @@ python3 miner/alice_miner.py \
 ## 5. 硬件要求
 
 - CUDA GPU `>= 24GB`：推荐
+- CUDA GPU `16GB`：支持，但更慢（`batch_size=1`）
+- Apple Silicon `16GB`：支持，但会很慢（依赖 macOS swap，`batch_size=1`）
 - Apple Silicon `>= 24GB`：支持
+- Apple Silicon `>= 32GB`：推荐
 - CPU `>= 32GB RAM`：支持，但非常慢
-- `< 20GB`：不支持
+- `< 16GB`：不支持
 
 CPU 挖矿可运行，但通常只有 GPU 的 `1/50 - 1/100` 速度，提交更少，奖励也会显著更低。
 

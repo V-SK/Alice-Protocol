@@ -1119,9 +1119,12 @@ def request_task(
         if resp.status_code == 200:
             task = resp.json()
             assigned_layers = task.get('assigned_layers', list(range(32)))
+            assigned_batch_size = int(task.get("assigned_batch_size", 0) or 0)
             print(f"📋 Task assigned: shard {task['shard_id']}, "
                   f"layers {len(assigned_layers)}/32, "
                   f"task_id={task['task_id'][:8]}...")
+            if assigned_batch_size > 0:
+                print(f"   📋 PS assigned batch_size cap: {assigned_batch_size}")
             return task
         elif resp.status_code == 503:
             print("⏳ No tasks available, waiting...")
@@ -1169,11 +1172,14 @@ def request_task_detailed(
         if resp.status_code == 200:
             task = resp.json()
             assigned_layers = task.get("assigned_layers", list(range(32)))
+            assigned_batch_size = int(task.get("assigned_batch_size", 0) or 0)
             print(
                 f"📋 Task assigned: shard {task['shard_id']}, "
                 f"layers {len(assigned_layers)}/32, "
                 f"task_id={task['task_id'][:8]}..."
             )
+            if assigned_batch_size > 0:
+                print(f"   📋 PS assigned batch_size cap: {assigned_batch_size}")
             return task, "ok"
 
         if resp.status_code == 503:
@@ -2158,8 +2164,11 @@ def main():
 
             assigned_layers = pending_task.get("assigned_layers", [0, 1, 2, 3, 4, 5, 6, 7])
             ps_version = pending_task.get("model_version", 0)
+            ps_assigned_batch_cap = int(pending_task.get("assigned_batch_size", 0) or 0)
             print(f"   📋 Assigned layers: {assigned_layers}")
             print(f"   📋 PS model version: {ps_version}")
+            if ps_assigned_batch_cap > 0:
+                print(f"   📋 PS assigned batch_size cap: {ps_assigned_batch_cap}")
 
             # Download/cache model (shared per host, versioned)
             if args.model_path and args.model_path.exists():
@@ -2327,10 +2336,14 @@ def main():
                 seq_len=runtime_seq_len,
             )
             dynamic_batch_size = conservative_start_batch(device.type, batch_size_cap)
+            if ps_assigned_batch_cap > 0:
+                batch_size_cap = max(1, min(batch_size_cap, ps_assigned_batch_cap))
+                dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
+                print(f"📊 Batch size cap assigned by PS: {batch_size_cap}")
             if args.batch_size > 0:
                 batch_size_cap = max(1, min(batch_size_cap, args.batch_size))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
-                print(f"📊 Batch size cap overridden by --batch-size: {batch_size_cap}")
+                print(f"📊 Runtime batch cap lowered by --batch-size: {batch_size_cap}")
             if profile_batch_cap > 0:
                 batch_size_cap = max(1, min(batch_size_cap, profile_batch_cap))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
@@ -2347,6 +2360,8 @@ def main():
                 f"(available: {available_gb:.1f}GB, per_sample: {per_sample_gb:.1f}GB)"
             )
             print(f"   Batch cap: {batch_size_cap} (gradual ramp enabled)")
+            if ps_assigned_batch_cap > 0:
+                print(f"   PS batch cap: {ps_assigned_batch_cap}")
             print(f"   Precision: {precision}")
             print(f"   Gradient scale (lr): {args.lr}")
             print(f"   Seq len: {runtime_seq_len}")

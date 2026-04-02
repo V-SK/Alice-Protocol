@@ -75,8 +75,11 @@ See `docs/HARDWARE_REQUIREMENTS.md` for the full matrix.
 
 Summary:
 - CUDA GPU `>= 24GB`: recommended
+- CUDA GPU `16GB`: supported, slower (`batch_size=1`)
+- Apple Silicon `16GB`: supported, very slow (macOS swap, `batch_size=1`)
 - Apple Silicon `>= 24GB`: supported
+- Apple Silicon `>= 32GB`: recommended
 - CPU `>= 32GB RAM`: supported but very slow
-- `< 20GB`: not supported
+- `< 16GB`: not supported
 
 CPU mining is supported but not recommended. Expect roughly `1/50 - 1/100` of GPU throughput and proportionally lower rewards.
