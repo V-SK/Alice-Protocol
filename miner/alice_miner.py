@@ -60,6 +60,9 @@ ASSIGNMENT_CACHE_PATH = Path.home() / ".alice" / "assignment_cache.json"
 ASSIGNMENT_RETRY_ATTEMPTS = 3
 ASSIGNMENT_RETRY_DELAY_S = 5
 DIRECT_ASSIGNMENT_RECHECK_S = 300
+MEASURED_MODEL_PARAMS = 7_000_000_000
+MEASURED_MODEL_PARAMS_B = MEASURED_MODEL_PARAMS / 1_000_000_000.0
+MEASURED_TFLOPS_EMA_ALPHA = 0.35
 
 def auto_detect_device() -> Tuple[str, float, str]:
     """Auto-detect best available device and memory."""
@@ -374,6 +377,43 @@ def device_profile_key(wallet_address: str, capabilities: Dict[str, Any]) -> str
     device_type = str(capabilities.get("device_type", "unknown")).strip().lower()
     device_name = str(capabilities.get("device_name", "unknown")).strip().lower()
     return f"{wallet_address}|{device_type}|{device_name}"
+
+
+def update_measured_compute_capabilities(
+    capabilities: Dict[str, Any],
+    *,
+    seq_len: int,
+    num_batches: int,
+    batch_size: int,
+    training_time_s: float,
+) -> Optional[float]:
+    """Update runtime-only measured compute telemetry after a successful shard."""
+    if training_time_s <= 0 or num_batches <= 0 or batch_size <= 0 or seq_len <= 0:
+        return None
+    tokens_per_batch = float(batch_size) * float(seq_len)
+    flops_per_token = 6.0 * float(MEASURED_MODEL_PARAMS)
+    total_flops = tokens_per_batch * flops_per_token * float(num_batches)
+    measured_tflops = total_flops / float(training_time_s) / 1e12
+    if not math.isfinite(measured_tflops) or measured_tflops <= 0:
+        return None
+    prev_ema = capabilities.get("measured_tflops_ema")
+    try:
+        prev_ema_value = float(prev_ema) if prev_ema is not None else None
+    except (TypeError, ValueError):
+        prev_ema_value = None
+    ema_value = (
+        measured_tflops
+        if prev_ema_value is None or not math.isfinite(prev_ema_value) or prev_ema_value <= 0
+        else ((1.0 - MEASURED_TFLOPS_EMA_ALPHA) * prev_ema_value) + (MEASURED_TFLOPS_EMA_ALPHA * measured_tflops)
+    )
+    capabilities["measured_tflops"] = round(measured_tflops, 6)
+    capabilities["measured_tflops_ema"] = round(ema_value, 6)
+    capabilities["measurement_window_s"] = round(float(training_time_s), 3)
+    capabilities["measured_num_batches"] = int(num_batches)
+    capabilities["measured_batch_size"] = int(batch_size)
+    capabilities["measured_seq_len"] = int(seq_len)
+    capabilities["measured_model_params_b"] = MEASURED_MODEL_PARAMS_B
+    return measured_tflops
 
 
 def load_device_profile(path: Path, key: str) -> Dict[str, Any]:
@@ -1400,6 +1440,7 @@ def request_task_detailed(
         (task, status) where status is one of:
         - "ok": task available
         - "no_task": PS has no task currently
+        - "re_register": auth/session is no longer valid
         - "failed": request/network error
     """
     try:
@@ -1436,6 +1477,10 @@ def request_task_detailed(
             print(f"   {error.get('message', '')}")
             return None, "failed"
 
+        if resp.status_code in (401, 403):
+            print(f"⚠️ Runtime auth rejected on task request: {resp.status_code}")
+            return None, "re_register"
+
         print(f"❌ Task request failed: {resp.status_code} {resp.text}")
         return None, "failed"
 
@@ -1449,7 +1494,7 @@ def send_heartbeat(
     miner_id: str,
     capabilities: Dict,
     auth_token: Optional[str] = None,
-) -> bool:
+) -> str:
     """Best-effort miner heartbeat to keep instance active."""
     try:
         resp = requests.post(
@@ -1458,9 +1503,13 @@ def send_heartbeat(
             headers=_auth_headers(auth_token),
             timeout=5,
         )
-        return resp.status_code == 200
+        if resp.status_code == 200:
+            return "ok"
+        if resp.status_code in (401, 403):
+            return "re_register"
+        return "failed"
     except Exception:
-        return False
+        return "failed"
 
 
 def start_heartbeat_loop(
@@ -1469,19 +1518,24 @@ def start_heartbeat_loop(
     capabilities: Dict,
     auth_token: Optional[str],
     interval_s: int = 60,
-) -> tuple[threading.Event, threading.Thread]:
+) -> tuple[threading.Event, threading.Event, threading.Thread]:
     """Keep runtime miner registration alive during long downloads/training."""
     stop_event = threading.Event()
+    re_register_event = threading.Event()
 
     def _heartbeat_loop() -> None:
         while not stop_event.wait(interval_s):
-            ok = send_heartbeat(
+            status = send_heartbeat(
                 data_plane_url,
                 miner_id,
                 capabilities,
                 auth_token=auth_token,
             )
-            if not ok:
+            if status == "re_register":
+                print(f"⚠️ Runtime auth rejected on heartbeat, re-registering miner...")
+                re_register_event.set()
+                return
+            if status != "ok":
                 print(f"⚠️ Heartbeat failed for runtime endpoint {data_plane_url}")
 
     thread = threading.Thread(
@@ -1490,7 +1544,7 @@ def start_heartbeat_loop(
         name="runtime_heartbeat",
     )
     thread.start()
-    return stop_event, thread
+    return stop_event, re_register_event, thread
 
 
 def request_task_with_retry(
@@ -1522,6 +1576,9 @@ def request_task_with_retry(
             return task, "ok"
         if status == "no_task":
             return None, "no_task"
+        if status == "re_register":
+            print("⚠️ Runtime auth rejected, re-registering immediately")
+            return None, "re_register"
 
         fail_count += 1
         if fail_count < max_attempts:
@@ -2219,7 +2276,7 @@ def submit_gradient(
     gradient_data: Dict,
     metrics: Dict,
     auth_token: Optional[str] = None,
-) -> bool:
+) -> str:
     """Submit compressed gradient to PS with retry for transient failures."""
     submit_started_at = time.time()
     print(f"🧪 Submit timing: serialize_start t={submit_started_at:.3f}")
@@ -2264,15 +2321,19 @@ def submit_gradient(
                 score_val = result.get("score", "N/A")
                 score_str = f"{score_val:.4f}" if isinstance(score_val, (int, float)) else str(score_val)
                 print(f"✅ Gradient accepted! Score: {score_str}")
-                return True
+                return "accepted"
 
-            # 4xx usually means semantic rejection; no retry.
+            if resp.status_code in (401, 403):
+                print(f"⚠️ Runtime auth rejected on gradient submit: {resp.status_code}")
+                return "re_register"
+
+            # Other 4xx usually means semantic rejection; no retry.
             if 400 <= resp.status_code < 500:
                 error_data = resp.json() if resp.headers.get("content-type") == "application/json" else {}
                 print(f"❌ Gradient rejected: {resp.status_code}")
                 print(f"   Reason: {error_data.get('reason', 'Unknown')}")
                 print(f"   Score: {error_data.get('score', 'N/A')}")
-                return False
+                return "rejected"
 
             # 5xx can be transient; retry.
             raise requests.exceptions.RequestException(
@@ -2290,9 +2351,9 @@ def submit_gradient(
                 time.sleep(10)
             else:
                 print("⚠️ Submission failed after 3 attempts, discarding this gradient and requesting next task")
-                return False
+                return "failed"
 
-    return False
+    return "failed"
 
 
 def main():
@@ -2388,6 +2449,7 @@ def main():
     current_epoch_stats: Optional[Dict[str, Any]] = None
     profile_path = device_profile_path()
     heartbeat_stop: Optional[threading.Event] = None
+    heartbeat_re_register: Optional[threading.Event] = None
 
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
@@ -2396,6 +2458,7 @@ def main():
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
                 heartbeat_stop = None
+            heartbeat_re_register = None
             route_info = resolve_runtime_route(args.ps_url)
             data_plane_url = str(route_info.get("base_url") or args.ps_url)
             runtime_mode = str(route_info.get("mode") or "direct")
@@ -2440,7 +2503,7 @@ def main():
                 print("❌ Runtime registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
-            heartbeat_stop, _heartbeat_thread = start_heartbeat_loop(
+            heartbeat_stop, heartbeat_re_register, _heartbeat_thread = start_heartbeat_loop(
                 data_plane_url,
                 miner_instance_id,
                 capabilities,
@@ -2452,6 +2515,12 @@ def main():
             pending_task: Optional[Dict[str, Any]] = None
             reroute_required = False
             while pending_task is None:
+                if heartbeat_re_register is not None and heartbeat_re_register.is_set():
+                    if heartbeat_stop is not None:
+                        heartbeat_stop.set()
+                        heartbeat_stop = None
+                    heartbeat_re_register = None
+                    break
                 task, status = request_task_with_retry(
                     data_plane_url,
                     miner_instance_id,
@@ -2464,6 +2533,12 @@ def main():
                     pending_task = task
                     break
                 if status == "no_task":
+                    if heartbeat_re_register is not None and heartbeat_re_register.is_set():
+                        if heartbeat_stop is not None:
+                            heartbeat_stop.set()
+                            heartbeat_stop = None
+                        heartbeat_re_register = None
+                        break
                     live_epoch = _resolve_epoch_id(control_plane_url, None, auth_token=None)
                     if current_epoch_stats is None and live_epoch is not None:
                         current_epoch_stats = _new_miner_epoch_stats(
@@ -2481,7 +2556,19 @@ def main():
                     ):
                         _emit_miner_epoch_report(Path(args.report_dir), control_plane_url, current_epoch_stats)
                         current_epoch_stats = None
-                    send_heartbeat(data_plane_url, miner_instance_id, capabilities, auth_token=auth_token)
+                    heartbeat_status = send_heartbeat(
+                        data_plane_url,
+                        miner_instance_id,
+                        capabilities,
+                        auth_token=auth_token,
+                    )
+                    if heartbeat_status == "re_register":
+                        print("⚠️ Runtime auth rejected during idle heartbeat, re-registering...")
+                        if heartbeat_stop is not None:
+                            heartbeat_stop.set()
+                            heartbeat_stop = None
+                        heartbeat_re_register = None
+                        break
                     if runtime_mode == "direct" and (time.time() - last_assignment_probe) >= DIRECT_ASSIGNMENT_RECHECK_S:
                         refreshed_route = resolve_runtime_route(args.ps_url, retry_attempts=1, retry_delay_s=0)
                         last_assignment_probe = time.time()
@@ -2498,6 +2585,7 @@ def main():
                     if heartbeat_stop is not None:
                         heartbeat_stop.set()
                         heartbeat_stop = None
+                    heartbeat_re_register = None
                     break
 
             if reroute_required:
@@ -2508,6 +2596,7 @@ def main():
                 if heartbeat_stop is not None:
                     heartbeat_stop.set()
                     heartbeat_stop = None
+                heartbeat_re_register = None
                 time.sleep(30)
                 continue
 
@@ -2788,6 +2877,13 @@ def main():
                     task = pending_task
                     pending_task = None
                 else:
+                    if heartbeat_re_register is not None and heartbeat_re_register.is_set():
+                        print("⚠️ Runtime auth expired during training, re-registering...")
+                        if heartbeat_stop is not None:
+                            heartbeat_stop.set()
+                            heartbeat_stop = None
+                        heartbeat_re_register = None
+                        break
                     task, status = request_task_with_retry(
                         data_plane_url,
                         miner_instance_id,
@@ -2797,7 +2893,19 @@ def main():
                         max_attempts=5,
                     )
                     if status == "no_task":
-                        send_heartbeat(data_plane_url, miner_instance_id, capabilities, auth_token=auth_token)
+                        heartbeat_status = send_heartbeat(
+                            data_plane_url,
+                            miner_instance_id,
+                            capabilities,
+                            auth_token=auth_token,
+                        )
+                        if heartbeat_status == "re_register":
+                            print("⚠️ Runtime auth rejected during idle heartbeat, re-registering...")
+                            if heartbeat_stop is not None:
+                                heartbeat_stop.set()
+                                heartbeat_stop = None
+                            heartbeat_re_register = None
+                            break
                         if runtime_mode == "direct" and (time.time() - last_assignment_probe) >= DIRECT_ASSIGNMENT_RECHECK_S:
                             refreshed_route = resolve_runtime_route(args.ps_url, retry_attempts=1, retry_delay_s=0)
                             last_assignment_probe = time.time()
@@ -2814,6 +2922,7 @@ def main():
                         if heartbeat_stop is not None:
                             heartbeat_stop.set()
                             heartbeat_stop = None
+                        heartbeat_re_register = None
                         break
 
                 task_id = task["task_id"]
@@ -2938,6 +3047,7 @@ def main():
                 stable_shards += 1
                 oom_abort_streak = 0
                 invalid_streak = 0
+                trained_batch_size = int(dynamic_batch_size)
                 if dynamic_batch_size < batch_size_cap and stable_shards >= grow_every:
                     dynamic_batch_size += 1
                     stable_shards = 0
@@ -2951,6 +3061,24 @@ def main():
                     current_epoch_stats["batches_trained"] += int(num_batches)
                     current_epoch_stats["loss_sum"] += float(avg_loss)
                     current_epoch_stats["loss_count"] += 1
+                measured_tflops = update_measured_compute_capabilities(
+                    capabilities,
+                    seq_len=runtime_seq_len,
+                    num_batches=num_batches,
+                    batch_size=trained_batch_size,
+                    training_time_s=train_time,
+                )
+                if measured_tflops is not None:
+                    measured_tflops_ema = capabilities.get("measured_tflops_ema")
+                    print(
+                        "   ⚙️ Measured compute: "
+                        f"{measured_tflops:.2f} TFLOPS"
+                        + (
+                            f" (EMA {float(measured_tflops_ema):.2f} TFLOPS)"
+                            if measured_tflops_ema is not None
+                            else ""
+                        )
+                    )
 
                 if bad_param is not None:
                     invalid_streak += 1
@@ -2996,7 +3124,7 @@ def main():
                 print("📤 Submitting gradient...")
                 if current_epoch_stats is not None:
                     current_epoch_stats["gradients_submitted"] += 1
-                success = submit_gradient(
+                submit_status = submit_gradient(
                     data_plane_url,
                     task_id,
                     task_nonce,
@@ -3004,7 +3132,7 @@ def main():
                     metrics,
                     auth_token=auth_token,
                 )
-                if success:
+                if submit_status == "accepted":
                     gradients_accepted += 1
                     if current_epoch_stats is not None:
                         current_epoch_stats["gradients_accepted"] += 1
@@ -3063,6 +3191,16 @@ def main():
                                 )
                                 os.execv(sys.executable, [sys.executable] + sys.argv)
                     print(f"✅ Task {task_id[:8]}... completed in {train_time:.1f}s\n")
+                elif submit_status == "re_register":
+                    gradients_rejected += 1
+                    if current_epoch_stats is not None:
+                        current_epoch_stats["gradients_rejected"] += 1
+                    print("⚠️ Runtime auth rejected during submission, re-registering immediately...\n")
+                    if heartbeat_stop is not None:
+                        heartbeat_stop.set()
+                        heartbeat_stop = None
+                    heartbeat_re_register = None
+                    break
                 else:
                     gradients_rejected += 1
                     if current_epoch_stats is not None:
@@ -3085,6 +3223,7 @@ def main():
                         if heartbeat_stop is not None:
                             heartbeat_stop.set()
                             heartbeat_stop = None
+                        heartbeat_re_register = None
                         time.sleep(2)
                         break
                 time.sleep(2)
@@ -3093,6 +3232,7 @@ def main():
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
                 heartbeat_stop = None
+            heartbeat_re_register = None
             _emit_miner_epoch_report(Path(args.report_dir), control_plane_url, current_epoch_stats)
             current_epoch_stats = None
             print("\n🛑 Miner stopped by user")
@@ -3101,6 +3241,7 @@ def main():
             if heartbeat_stop is not None:
                 heartbeat_stop.set()
                 heartbeat_stop = None
+            heartbeat_re_register = None
             _emit_miner_epoch_report(Path(args.report_dir), control_plane_url, current_epoch_stats)
             current_epoch_stats = None
             print(f"❌ Unexpected error: {e}. Restarting in 30s...")
