@@ -2744,6 +2744,9 @@ def main():
             ps_assigned_batch_cap = int(pending_task.get("assigned_batch_size", 0) or 0)
             print(f"   📋 Assigned layers: {assigned_layers}")
             print(f"   📋 PS model version: {ps_version}")
+
+            # Error Feedback (init before first use; idempotent on re-registration)
+            ef_manager = ErrorFeedbackManager(enabled=args.use_error_feedback)
             ef_manager.set_model_version(ps_version)
             if ps_assigned_batch_cap > 0:
                 print(f"   📋 PS assigned batch_size cap: {ps_assigned_batch_cap}")
@@ -3010,8 +3013,6 @@ def main():
             min_lr = max(args.lr * 0.1, 1e-8)
             invalid_streak = 0
 
-            # Error Feedback
-            ef_manager = ErrorFeedbackManager(enabled=args.use_error_feedback)
             print(f"[CONFIG] Error Feedback: {'ON' if ef_manager.enabled else 'OFF'}")
             print(f"[CONFIG] Compression ratio: {compression_ratio} (TopK {compression_ratio*100:.1f}%)")
 
