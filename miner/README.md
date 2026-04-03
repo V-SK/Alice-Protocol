@@ -80,3 +80,10 @@ Summary:
 - `< 20GB`: not supported
 
 CPU mining is supported but not recommended. Expect roughly `1/50 - 1/100` of GPU throughput and proportionally lower rewards.
+
+For CUDA miners, registration uses the GPU's physical VRAM. If a node was previously downscaled after OOM recovery, the local runtime cap may still live in:
+
+- `~/.alice/device_profile.json`
+- `ALICE_MEMORY_CAP_GB`
+
+That runtime cap is separate from physical VRAM and is only meant to tune local stability.

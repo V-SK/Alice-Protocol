@@ -203,6 +203,7 @@ def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
         "device_type": device_type,
         "device_name": device_name,
         "memory_gb": float(memory_gb),
+        "runtime_memory_cap_gb": float(memory_gb),
         "system_memory_gb": float(ram_gb),
         "cpu_count": cpu_count,
         "platform": platform_name.lower(),
@@ -210,6 +211,7 @@ def detect_device_info(device_override: Optional[str] = None) -> Dict[str, Any]:
         "arch": arch,
         "vendor": vendor,
         "vram_gb": float(gpu_vram_gb if device_type == "cuda" else 0.0),
+        "physical_vram_gb": float(gpu_vram_gb if device_type == "cuda" else 0.0),
         "unified_memory_gb": float(ram_gb if device_type == "mps" else 0.0),
         "ram_gb": float(ram_gb),
         "cpu_model": cpu_model,
@@ -459,12 +461,22 @@ def register_miner(
             "device_type": capabilities.get("device_type", "cpu"),
             "device_name": capabilities.get("device_name", "unknown"),
             "memory_gb": float(capabilities.get("memory_gb", 0.0)),
+            "runtime_memory_cap_gb": float(capabilities.get("runtime_memory_cap_gb", capabilities.get("memory_gb", 0.0))),
             "system_memory_gb": float(capabilities.get("system_memory_gb", 0.0)),
             "platform": capabilities.get("platform", platform.system().lower()),
             "arch": capabilities.get("arch", platform.machine().lower()),
             "vendor": capabilities.get("vendor", "cpu"),
             "vram_gb": float(capabilities.get("vram_gb", 0.0)),
+            "gpu_vram_gb": float(capabilities.get("gpu_vram_gb", capabilities.get("vram_gb", 0.0))),
+            "physical_vram_gb": float(capabilities.get("physical_vram_gb", capabilities.get("gpu_vram_gb", capabilities.get("vram_gb", 0.0)))),
             "unified_memory_gb": float(capabilities.get("unified_memory_gb", 0.0)),
+            "ram_gb": float(capabilities.get("ram_gb", capabilities.get("system_memory_gb", 0.0))),
+            "cpu_model": capabilities.get("cpu_model", ""),
+            "gpu_model": capabilities.get("gpu_model", ""),
+            "gpu_count": int(capabilities.get("gpu_count", 0) or 0),
+            "cpu_count": int(capabilities.get("cpu_count", 0) or 0),
+            "python": capabilities.get("python", platform.python_version()),
+            "torch": capabilities.get("torch", torch.__version__),
         }
         payload = {
             "address": wallet_address,
@@ -474,9 +486,22 @@ def register_miner(
             "data_format": DATA_FORMAT,
             "capabilities": {
                 "memory_gb": float(capabilities.get("memory_gb", 0.0)),
+                "runtime_memory_cap_gb": float(capabilities.get("runtime_memory_cap_gb", capabilities.get("memory_gb", 0.0))),
                 "device_type": capabilities.get("device_type", "cpu"),
                 "device_name": capabilities.get("device_name", "unknown"),
                 "system_memory_gb": float(capabilities.get("system_memory_gb", 0.0)),
+                "ram_gb": float(capabilities.get("ram_gb", capabilities.get("system_memory_gb", 0.0))),
+                "vram_gb": float(capabilities.get("vram_gb", 0.0)),
+                "gpu_vram_gb": float(capabilities.get("gpu_vram_gb", capabilities.get("vram_gb", 0.0))),
+                "physical_vram_gb": float(capabilities.get("physical_vram_gb", capabilities.get("gpu_vram_gb", capabilities.get("vram_gb", 0.0)))),
+                "unified_memory_gb": float(capabilities.get("unified_memory_gb", 0.0)),
+                "platform": capabilities.get("platform", platform.system().lower()),
+                "arch": capabilities.get("arch", platform.machine().lower()),
+                "vendor": capabilities.get("vendor", "cpu"),
+                "cpu_model": capabilities.get("cpu_model", ""),
+                "gpu_model": capabilities.get("gpu_model", ""),
+                "gpu_count": int(capabilities.get("gpu_count", 0) or 0),
+                "cpu_count": int(capabilities.get("cpu_count", 0) or 0),
             },
             "device_info": device_info,
             "reward_address": capabilities.get("reward_address"),
@@ -906,7 +931,7 @@ def apply_delta_update(base_model_path: Path, output_model_path: Path, delta_dat
     Returns:
         True if successful
     """
-    from src.compression import decompress_gradients
+    from core.compression import decompress_gradients
 
     print(f"🔄 Applying delta update (v{from_version} → v{to_version})...")
 
