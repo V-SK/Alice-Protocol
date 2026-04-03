@@ -1462,6 +1462,36 @@ def send_heartbeat(
         return False
 
 
+def start_heartbeat_loop(
+    data_plane_url: str,
+    miner_id: str,
+    capabilities: Dict,
+    auth_token: Optional[str],
+    interval_s: int = 60,
+) -> tuple[threading.Event, threading.Thread]:
+    """Keep runtime miner registration alive during long downloads/training."""
+    stop_event = threading.Event()
+
+    def _heartbeat_loop() -> None:
+        while not stop_event.wait(interval_s):
+            ok = send_heartbeat(
+                data_plane_url,
+                miner_id,
+                capabilities,
+                auth_token=auth_token,
+            )
+            if not ok:
+                print(f"⚠️ Heartbeat failed for runtime endpoint {data_plane_url}")
+
+    thread = threading.Thread(
+        target=_heartbeat_loop,
+        daemon=True,
+        name="runtime_heartbeat",
+    )
+    thread.start()
+    return stop_event, thread
+
+
 def request_task_with_retry(
     ps_url: str,
     wallet_address: str,
@@ -2356,11 +2386,15 @@ def main():
     gradients_rejected = 0
     current_epoch_stats: Optional[Dict[str, Any]] = None
     profile_path = device_profile_path()
+    heartbeat_stop: Optional[threading.Event] = None
 
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
         control_plane_url = str(args.ps_url)
         try:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+                heartbeat_stop = None
             route_info = resolve_runtime_route(args.ps_url)
             data_plane_url = str(route_info.get("base_url") or args.ps_url)
             runtime_mode = str(route_info.get("mode") or "direct")
@@ -2405,6 +2439,12 @@ def main():
                 print("❌ Runtime registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
+            heartbeat_stop, _heartbeat_thread = start_heartbeat_loop(
+                data_plane_url,
+                miner_instance_id,
+                capabilities,
+                auth_token=auth_token,
+            )
 
             # Use first assigned task to learn layer assignment + model version.
             print("📥 Requesting task to get layer assignment...")
@@ -2446,11 +2486,17 @@ def main():
                         last_assignment_probe = time.time()
                         if _normalize_base_url(refreshed_route.get("base_url", "")) != _normalize_base_url(data_plane_url):
                             print("🔀 Aggregator assignment recovered; re-registering on new runtime endpoint...")
+                            if heartbeat_stop is not None:
+                                heartbeat_stop.set()
+                                heartbeat_stop = None
                             reroute_required = True
                             break
                     time.sleep(10)
                     continue
                 if status == "re_register":
+                    if heartbeat_stop is not None:
+                        heartbeat_stop.set()
+                        heartbeat_stop = None
                     break
 
             if reroute_required:
@@ -2458,6 +2504,9 @@ def main():
             if pending_task is None:
                 # Could not acquire task after retries; restart registration flow.
                 print("⚠️ Could not acquire task after retries, re-registering...")
+                if heartbeat_stop is not None:
+                    heartbeat_stop.set()
+                    heartbeat_stop = None
                 time.sleep(30)
                 continue
 
@@ -2753,11 +2802,17 @@ def main():
                             last_assignment_probe = time.time()
                             if _normalize_base_url(refreshed_route.get("base_url", "")) != _normalize_base_url(data_plane_url):
                                 print("🔀 Aggregator assignment recovered; re-registering on new runtime endpoint...")
+                                if heartbeat_stop is not None:
+                                    heartbeat_stop.set()
+                                    heartbeat_stop = None
                                 break
                         time.sleep(10)
                         continue
                     if status == "re_register" or task is None:
                         print("⚠️ Re-registering after repeated task request failures...")
+                        if heartbeat_stop is not None:
+                            heartbeat_stop.set()
+                            heartbeat_stop = None
                         break
 
                 task_id = task["task_id"]
@@ -3026,16 +3081,25 @@ def main():
                     last_assignment_probe = time.time()
                     if _normalize_base_url(refreshed_route.get("base_url", "")) != _normalize_base_url(data_plane_url):
                         print("🔀 Aggregator assignment recovered; re-registering on new runtime endpoint...")
+                        if heartbeat_stop is not None:
+                            heartbeat_stop.set()
+                            heartbeat_stop = None
                         time.sleep(2)
                         break
                 time.sleep(2)
 
         except KeyboardInterrupt:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+                heartbeat_stop = None
             _emit_miner_epoch_report(Path(args.report_dir), control_plane_url, current_epoch_stats)
             current_epoch_stats = None
             print("\n🛑 Miner stopped by user")
             return
         except Exception as e:
+            if heartbeat_stop is not None:
+                heartbeat_stop.set()
+                heartbeat_stop = None
             _emit_miner_epoch_report(Path(args.report_dir), control_plane_url, current_epoch_stats)
             current_epoch_stats = None
             print(f"❌ Unexpected error: {e}. Restarting in 30s...")
