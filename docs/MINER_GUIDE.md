@@ -86,6 +86,20 @@ It does **not** connect directly to the aggregator.
 
 CPU mining is supported but not recommended.
 
+For CUDA miners, the client now reports both:
+
+- physical VRAM: the GPU's total memory
+- runtime memory cap: any temporary local cap learned from prior OOM recovery
+
+The PS admission check uses physical VRAM so a 24GB card is not misclassified as an unsupported GPU just because a local runtime cap was lowered.
+
+If you are reusing a machine from an older private beta and the miner still behaves like it has a much smaller GPU, inspect:
+
+- `~/.alice/device_profile.json`
+- `ALICE_MEMORY_CAP_GB`
+
+Those are local runtime throttles, not the source of truth for physical VRAM.
+
 ## 6. Rewards
 
 Rewards are paid to:
