@@ -1,16 +1,11 @@
 # Alice Protocol
 
-Private release-prep repository for the public Alice miner and scorer distribution.
+Public Alice Protocol miner and scorer distribution.
 
-This repository is the staged public candidate for:
+This repository contains:
 - `miner/`: external miner client
 - `scorer/`: external scorer worker
 - `shared/`: shared Alice model runtime
-
-Current status:
-- private only
-- external miner access remains restricted
-- documentation is being aligned with the live mainnet implementation
 
 ## Repository Layout
 
@@ -33,19 +28,25 @@ Entry point: `miner/alice_miner.py`
 Bootstrap:
 
 ```bash
-./miner/bootstrap.sh
+./miner/bootstrap.sh --ps-url https://ps.aliceprotocol.org --address YOUR_ADDRESS
 ```
 
 Windows:
 
 ```powershell
-.\miner\bootstrap.ps1
+.\miner\bootstrap.ps1 -PsUrl https://ps.aliceprotocol.org -Address YOUR_ADDRESS
 ```
 
 Managed service:
 
 - Linux/macOS: `./miner/install-service.sh`
 - Windows: `.\miner\install-service.ps1`
+
+Guides:
+
+- `miner/README.md`
+- `docs/MINER_GUIDE.md`
+- `docs/MINER_GUIDE_CN.md`
 
 ### Scorer
 
@@ -70,17 +71,20 @@ Managed service:
 
 ## Documentation
 
-- `docs/MINER_GUIDE.md`
-- `docs/MINER_GUIDE_CN.md`
-- `docs/SCORER_GUIDE.md`
-- `docs/HARDWARE_REQUIREMENTS.md`
+- Miner:
+  - `miner/README.md`
+  - `docs/MINER_GUIDE.md`
+  - `docs/MINER_GUIDE_CN.md`
+- Scorer:
+  - `docs/SCORER_GUIDE.md`
+- Hardware:
+  - `docs/HARDWARE_REQUIREMENTS.md`
 
 ## Notes
 
-- This repository is not public yet.
-- Network admission for outside miners remains restricted.
 - Bootstrap is the default user entry point for both miner and scorer.
 - Managed services are available for Linux, macOS, and Windows.
 - Per-epoch local reports are written to `~/.alice/reports/`.
 - Scorer bootstrap auto-fetches the held-out validation shards into `scorer/data/validation` by default.
-- Full cross-platform validation remains a release gate before any public launch.
+- Multi-GPU mining uses one miner process per GPU via `CUDA_VISIBLE_DEVICES` plus unique `--instance-id` values.
+- Miner rewards go to `--reward-address` when provided, otherwise to `--address`.

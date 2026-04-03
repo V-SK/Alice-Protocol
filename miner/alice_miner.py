@@ -1225,9 +1225,12 @@ def request_task(
         if resp.status_code == 200:
             task = resp.json()
             assigned_layers = task.get('assigned_layers', list(range(32)))
+            assigned_batch_size = int(task.get("assigned_batch_size", 0) or 0)
             print(f"📋 Task assigned: shard {task['shard_id']}, "
                   f"layers {len(assigned_layers)}/32, "
                   f"task_id={task['task_id'][:8]}...")
+            if assigned_batch_size > 0:
+                print(f"   📋 PS assigned batch_size cap: {assigned_batch_size}")
             return task
         elif resp.status_code == 503:
             print("⏳ No tasks available, waiting...")
@@ -1275,11 +1278,14 @@ def request_task_detailed(
         if resp.status_code == 200:
             task = resp.json()
             assigned_layers = task.get("assigned_layers", list(range(32)))
+            assigned_batch_size = int(task.get("assigned_batch_size", 0) or 0)
             print(
                 f"📋 Task assigned: shard {task['shard_id']}, "
                 f"layers {len(assigned_layers)}/32, "
                 f"task_id={task['task_id'][:8]}..."
             )
+            if assigned_batch_size > 0:
+                print(f"   📋 PS assigned batch_size cap: {assigned_batch_size}")
             return task, "ok"
 
         if resp.status_code == 503:
@@ -2029,9 +2035,18 @@ def submit_gradient(
     auth_token: Optional[str] = None,
 ) -> bool:
     """Submit compressed gradient to PS with retry for transient failures."""
+    submit_started_at = time.time()
+    print(f"🧪 Submit timing: serialize_start t={submit_started_at:.3f}")
     # Compute hash once to avoid repeated serialization work on retries.
     gradient_bytes = json.dumps(gradient_data, sort_keys=True).encode()
+    after_serialize = time.time()
+    print(
+        f"🧪 Submit timing: serialize_done dt={after_serialize - submit_started_at:.3f}s "
+        f"bytes={len(gradient_bytes)}"
+    )
     gradient_hash = hashlib.sha256(gradient_bytes).hexdigest()
+    after_hash = time.time()
+    print(f"🧪 Submit timing: hash_done dt={after_hash - after_serialize:.3f}s")
 
     payload = {
         "task_id": task_id,
@@ -2044,11 +2059,18 @@ def submit_gradient(
     max_attempts = 3
     for attempt in range(1, max_attempts + 1):
         try:
+            before_post = time.time()
+            print(f"🧪 Submit timing: http_post_start attempt={attempt} t={before_post:.3f}")
             resp = requests.post(
                 f"{ps_url}/task/complete",
                 json=payload,
                 headers=_auth_headers(auth_token),
                 timeout=900,
+            )
+            after_post = time.time()
+            print(
+                f"🧪 Submit timing: http_post_done attempt={attempt} "
+                f"status={resp.status_code} dt={after_post - before_post:.3f}s"
             )
 
             if resp.status_code == 200:
@@ -2072,6 +2094,11 @@ def submit_gradient(
             )
 
         except (requests.exceptions.Timeout, requests.exceptions.ConnectionError, requests.exceptions.RequestException) as e:
+            failure_time = time.time()
+            print(
+                f"🧪 Submit timing: http_post_error attempt={attempt} "
+                f"dt={failure_time - submit_started_at:.3f}s error={e}"
+            )
             if attempt < max_attempts:
                 print(f"⚠️ Submission failed, retrying... (attempt {attempt}/{max_attempts}) error={e}")
                 time.sleep(10)
@@ -2096,8 +2123,8 @@ def main():
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
-        help="Max batch size cap (default: 2)",
+        default=None,
+        help="Manual batch size cap override (normally assigned by PS)",
     )
     parser.add_argument(
         "--lr",
@@ -2264,8 +2291,11 @@ def main():
 
             assigned_layers = pending_task.get("assigned_layers", [0, 1, 2, 3, 4, 5, 6, 7])
             ps_version = pending_task.get("model_version", 0)
+            ps_assigned_batch_cap = int(pending_task.get("assigned_batch_size", 0) or 0)
             print(f"   📋 Assigned layers: {assigned_layers}")
             print(f"   📋 PS model version: {ps_version}")
+            if ps_assigned_batch_cap > 0:
+                print(f"   📋 PS assigned batch_size cap: {ps_assigned_batch_cap}")
 
             # Download/cache model (shared per host, versioned)
             if args.model_path and args.model_path.exists():
@@ -2433,10 +2463,18 @@ def main():
                 seq_len=runtime_seq_len,
             )
             dynamic_batch_size = conservative_start_batch(device.type, batch_size_cap)
-            if args.batch_size > 0:
+            if ps_assigned_batch_cap > 0:
+                batch_size_cap = max(1, min(batch_size_cap, ps_assigned_batch_cap))
+                dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
+                print(f"📊 Batch size cap assigned by PS: {batch_size_cap}")
+            else:
+                batch_size_cap = max(1, min(batch_size_cap, 2))
+                dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
+                print(f"📊 Fallback batch size cap (no PS assignment): {batch_size_cap}")
+            if args.batch_size is not None and args.batch_size > 0:
                 batch_size_cap = max(1, min(batch_size_cap, args.batch_size))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
-                print(f"📊 Batch size cap overridden by --batch-size: {batch_size_cap}")
+                print(f"📊 Manual --batch-size override applied: {batch_size_cap}")
             if profile_batch_cap > 0:
                 batch_size_cap = max(1, min(batch_size_cap, profile_batch_cap))
                 dynamic_batch_size = max(1, min(dynamic_batch_size, batch_size_cap))
@@ -2454,6 +2492,8 @@ def main():
                 f"(available: {available_gb:.1f}GB, per_sample: {per_sample_gb:.1f}GB)"
             )
             print(f"   Batch cap: {batch_size_cap} (gradual ramp enabled)")
+            if ps_assigned_batch_cap > 0:
+                print(f"   PS batch cap: {ps_assigned_batch_cap}")
             print(f"   Precision: {precision}")
             print(f"   Gradient scale (lr): {args.lr}")
             print(f"   Seq len: {runtime_seq_len}")

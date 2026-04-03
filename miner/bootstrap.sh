@@ -50,9 +50,15 @@ def total_mem_gb() -> float:
 
 mem_gb = total_mem_gb()
 if mem_gb:
+    system = platform.system()
     print(f"[bootstrap] Detected system memory: {mem_gb:.1f} GB")
-    if mem_gb < 20:
-        print("[bootstrap] WARNING: <20GB memory is not supported.")
+    if system == "Darwin" and mem_gb >= 16 and mem_gb < 24:
+        print("[bootstrap] NOTE: 16GB unified memory detected.")
+        print("[bootstrap] NOTE: Training will use swap and may be slow.")
+        print("[bootstrap] NOTE: PS will assign batch_size=1.")
+    elif mem_gb >= 16 and mem_gb < 24:
+        print("[bootstrap] WARNING: 16GB memory detected.")
+        print("[bootstrap] WARNING: Mining is supported but slow; PS will assign batch_size=1.")
     elif mem_gb < 32:
         print("[bootstrap] WARNING: CPU-only mining below 32GB RAM is not recommended.")
 
