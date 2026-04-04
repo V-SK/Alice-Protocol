@@ -495,6 +495,30 @@ def notify_shard_complete(
         return False
 
 
+def confirm_shard_complete(
+    ps_url: str,
+    miner_id: str,
+    token: str,
+    shard_id: int,
+    epoch: Optional[int] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "miner_id": str(miner_id),
+        "shard_id": int(shard_id),
+    }
+    if epoch is not None:
+        payload["epoch"] = int(epoch)
+    try:
+        requests.post(
+            f"{_normalize_url(ps_url)}/shard/confirm",
+            json=payload,
+            headers=miner_lib._auth_headers(token),
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def wait_for_next_epoch(trainer: LocalTrainer, poll_interval_s: int = 15) -> None:
     start_version = trainer.current_model_version
     for _ in range(max(1, SUBMIT_WINDOW_S // poll_interval_s)):
@@ -590,6 +614,13 @@ def run_plan_b(args: Any) -> None:
                         continue
                     avg_loss = trainer.train_shard_local(shard_data)
                     notify_shard_complete(data_plane_url, wallet_address, auth_token, task, avg_loss)
+                    confirm_shard_complete(
+                        trainer.ps_url,
+                        trainer.miner_address,
+                        trainer.token,
+                        int(shard_id),
+                        task.get("epoch"),
+                    )
                     completed_shards += 1
 
                 if heartbeat_re_register is not None and heartbeat_re_register.is_set():

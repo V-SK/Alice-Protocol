@@ -2518,6 +2518,30 @@ def submit_gradient(
     return "failed"
 
 
+def confirm_shard_complete(
+    ps_url: str,
+    miner_id: str,
+    shard_id: int,
+    epoch: Optional[int],
+    auth_token: Optional[str] = None,
+) -> None:
+    payload: Dict[str, Any] = {
+        "miner_id": str(miner_id),
+        "shard_id": int(shard_id),
+    }
+    if epoch is not None:
+        payload["epoch"] = int(epoch)
+    try:
+        requests.post(
+            f"{ps_url}/shard/confirm",
+            json=payload,
+            headers=_auth_headers(auth_token),
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Alice Miner V2 - Tiered Training")
     parser.add_argument("--ps-url", required=True, help="Parameter server URL")
@@ -3176,6 +3200,13 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     compression_ratio=compression_ratio,
                     grad_scale=current_lr,
                     ef_manager=ef_manager,
+                )
+                confirm_shard_complete(
+                    control_plane_url,
+                    miner_instance_id,
+                    int(shard_id),
+                    task_epoch,
+                    auth_token=auth_token,
                 )
 
                 train_time = time.time() - start_time
