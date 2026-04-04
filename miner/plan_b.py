@@ -109,6 +109,29 @@ class LocalTrainer:
             raise RuntimeError("Plan B model is not initialized")
         self.model.train()
         self.model.zero_grad(set_to_none=True)
+        local_lr = float(self.args.local_lr)
+        hooks: List[Any] = []
+        for param in self.model.parameters():
+            if not param.requires_grad:
+                continue
+            if not hasattr(param, "register_post_accumulate_grad_hook"):
+                raise RuntimeError(
+                    "register_post_accumulate_grad_hook is unavailable in this PyTorch build"
+                )
+
+            def _hook(
+                _: torch.Tensor,
+                *,
+                _param: torch.Tensor = param,
+                _lr: float = local_lr,
+            ) -> None:
+                grad = _param.grad
+                if grad is None:
+                    return
+                _param.data = (_param.data.float() - _lr * grad.float()).to(_param.dtype)
+                _param.grad = None
+
+            hooks.append(param.register_post_accumulate_grad_hook(_hook))
         tokens = _extract_tokens(shard_data)
         seq_len = int(getattr(self.args, "seq_len", 128) or 128)
         max_batches = int(getattr(self.args, "max_batches", 10) or 10)
@@ -117,47 +140,45 @@ class LocalTrainer:
         total_loss = 0.0
         num_batches = 0
 
-        while start_idx < max(1, tokens.numel() - seq_len - 1) and num_batches < max_batches:
-            batch_inputs: List[torch.Tensor] = []
-            batch_labels: List[torch.Tensor] = []
-            for batch_offset in range(batch_size):
-                offset = start_idx + batch_offset * seq_len
-                if offset + seq_len + 1 > tokens.numel():
+        try:
+            while start_idx < max(1, tokens.numel() - seq_len - 1) and num_batches < max_batches:
+                batch_inputs: List[torch.Tensor] = []
+                batch_labels: List[torch.Tensor] = []
+                for batch_offset in range(batch_size):
+                    offset = start_idx + batch_offset * seq_len
+                    if offset + seq_len + 1 > tokens.numel():
+                        break
+                    chunk = tokens[offset : offset + seq_len + 1]
+                    batch_inputs.append(chunk[:-1])
+                    batch_labels.append(chunk[1:])
+                if not batch_inputs:
                     break
-                chunk = tokens[offset : offset + seq_len + 1]
-                batch_inputs.append(chunk[:-1])
-                batch_labels.append(chunk[1:])
-            if not batch_inputs:
-                break
 
-            input_ids = torch.stack(batch_inputs).to(self.device)
-            labels = torch.stack(batch_labels).to(self.device)
-            use_amp = self.device.type in ("cuda", "mps") and str(getattr(self.args, "precision", "auto")) != "fp32"
-            autocast_dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
-            with (torch.autocast(device_type=self.device.type, dtype=autocast_dtype) if use_amp else contextlib.nullcontext()):
-                _, loss = self.model(input_ids, labels)
+                input_ids = torch.stack(batch_inputs).to(self.device)
+                labels = torch.stack(batch_labels).to(self.device)
+                use_amp = self.device.type in ("cuda", "mps") and str(getattr(self.args, "precision", "auto")) != "fp32"
+                autocast_dtype = torch.float16 if self.device.type in ("cuda", "mps") else torch.float32
+                with (torch.autocast(device_type=self.device.type, dtype=autocast_dtype) if use_amp else contextlib.nullcontext()):
+                    _, loss = self.model(input_ids, labels)
 
-            if loss is None or not torch.isfinite(loss):
-                _plan_b_log("Skipping invalid local loss batch")
-                self.model.zero_grad(set_to_none=True)
+                if loss is None or not torch.isfinite(loss):
+                    _plan_b_log("Skipping invalid local loss batch")
+                    self.model.zero_grad(set_to_none=True)
+                    start_idx += len(batch_inputs) * seq_len
+                    del input_ids, labels, loss
+                    continue
+
+                loss.backward()
+
+                total_loss += float(loss.item())
+                num_batches += 1
                 start_idx += len(batch_inputs) * seq_len
-                continue
 
-            loss.backward()
-            with torch.no_grad():
-                for param in self.model.parameters():
-                    if param.grad is None:
-                        continue
-                    param.data = (
-                        param.data.float() - float(self.args.local_lr) * param.grad.float()
-                    ).to(param.dtype)
-                    param.grad = None
-
-            total_loss += float(loss.item())
-            num_batches += 1
-            start_idx += len(batch_inputs) * seq_len
-
-        self.model.zero_grad(set_to_none=True)
+                del input_ids, labels, loss
+        finally:
+            for hook in hooks:
+                hook.remove()
+            self.model.zero_grad(set_to_none=True)
         avg_loss = total_loss / num_batches if num_batches > 0 else 0.0
         _plan_b_log(f"Local shard training complete: batches={num_batches}, avg_loss={avg_loss:.4f}")
         return avg_loss
