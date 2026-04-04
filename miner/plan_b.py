@@ -360,18 +360,16 @@ class LocalTrainer:
         if layer_indices:
             alice_config.num_layers = max(layer_indices) + 1
 
+        precision_mode = str(getattr(self.args, "precision", "auto"))
         model = miner_lib.AliceForCausalLM(alice_config)
-        model.load_state_dict(state_dict, strict=False)
-        if hasattr(model, "gradient_checkpointing_enable"):
-            model.gradient_checkpointing_enable()
-        if self.device.type in ("cuda", "mps"):
-            precision_mode = str(getattr(self.args, "precision", "auto"))
-            if precision_mode != "fp32":
-                model = model.half()
-            else:
-                model = model.float()
+        if self.device.type in ("cuda", "mps") and precision_mode != "fp32":
+            model = model.half()
         else:
             model = model.float()
+        model.load_state_dict(state_dict, strict=False)
+        del state_dict
+        if hasattr(model, "gradient_checkpointing_enable"):
+            model.gradient_checkpointing_enable()
         return model.to(self.device)
 
     def download_full_model(self, version: Optional[int] = None) -> int:

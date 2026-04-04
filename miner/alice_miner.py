@@ -2826,11 +2826,28 @@ def run_plan_a(args: argparse.Namespace) -> None:
             alice_config.num_layers = len(assigned_layers)  # KEY: N layers, not 32
 
             print(f"DEBUG config.num_layers = {alice_config.num_layers}")
-            print(f"DEBUG config.num_hidden_layers = {getattr(alice_config, 'num_hidden_layers', 'NOT SET')}")
             # Build the partial model normally so all buffers are initialized.
             # The meta->to_empty path can leave non-parameter buffers uninitialized
             # when loading with strict=False, which leads to NaN during forward pass.
+            n_layers = 32  # Total layers in full model (partial model has fewer)
+            device = torch.device(capabilities["device_type"])
+            if device.type == "cuda":
+                total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+            elif device.type == "mps":
+                total_memory_gb = float(capabilities.get("memory_gb", 16.0))
+            else:
+                total_memory_gb = float(capabilities.get("system_memory_gb", 0.0))
+            precision_mode = select_precision(
+                device_type=device.type,
+                memory_gb=total_memory_gb,
+                assigned_layers=len(assigned_layers),
+                requested=args.precision,
+            )
             model = AliceForCausalLM(alice_config)
+            if precision_mode == "fp16":
+                model = model.half()
+            else:
+                model = model.float()
 
             # Map layer indices: assigned_layers -> 0..N-1
             print("   Mapping layer weights...")
@@ -2872,26 +2889,8 @@ def run_plan_a(args: argparse.Namespace) -> None:
             print(f"DEBUG params = {sum(p.numel() for p in model.parameters()) / 1e6:.1f}M")
 
             # Move model to target precision/device.
-            n_layers = 32  # Total layers in full model (partial model has fewer)
-            device = torch.device(capabilities["device_type"])
-            if device.type == "cuda":
-                total_memory_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-            elif device.type == "mps":
-                total_memory_gb = float(capabilities.get("memory_gb", 16.0))
-            else:
-                total_memory_gb = float(capabilities.get("system_memory_gb", 0.0))
-            precision_mode = select_precision(
-                device_type=device.type,
-                memory_gb=total_memory_gb,
-                assigned_layers=len(assigned_layers),
-                requested=args.precision,
-            )
             print(f"🎯 Target device: {device}")
             if device.type == "cuda":
-                if precision_mode == "fp16":
-                    model = model.half()
-                else:
-                    model = model.float()
                 print(f"🚀 Moving model to {device}...")
                 try:
                     model = model.to(device)
@@ -2900,18 +2899,14 @@ def run_plan_a(args: argparse.Namespace) -> None:
                         raise
                     print("⚠️ OOM on full model.to(device), falling back to per-parameter transfer...")
                     if precision_mode == "fp16":
-                        model = model._apply(lambda t: t.half().to(device))
+                        model = model._apply(lambda t: t.to(device))
                     else:
-                        model = model._apply(lambda t: t.float().to(device))
+                        model = model._apply(lambda t: t.to(device))
             elif device.type == "mps":
-                if precision_mode == "fp16":
-                    model = model.half()
-                else:
-                    model = model.float()
                 print(f"🚀 Moving model to {device}...")
                 model = model.to(device)
             else:
-                model = model.float().to(device)
+                model = model.to(device)
 
             # Verify model is on correct device
             first_param = next(model.parameters())
