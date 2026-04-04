@@ -361,11 +361,17 @@ class LocalTrainer:
             alice_config.num_layers = max(layer_indices) + 1
 
         precision_mode = str(getattr(self.args, "precision", "auto"))
-        model = miner_lib.AliceForCausalLM(alice_config)
-        if self.device.type in ("cuda", "mps") and precision_mode != "fp32":
-            model = model.half()
-        else:
-            model = model.float()
+        build_dtype = (
+            torch.float16
+            if self.device.type in ("cuda", "mps") and precision_mode != "fp32"
+            else torch.float32
+        )
+        prev_dtype = torch.get_default_dtype()
+        try:
+            torch.set_default_dtype(build_dtype)
+            model = miner_lib.AliceForCausalLM(alice_config)
+        finally:
+            torch.set_default_dtype(prev_dtype)
         model.load_state_dict(state_dict, strict=False)
         del state_dict
         if hasattr(model, "gradient_checkpointing_enable"):
@@ -382,7 +388,7 @@ class LocalTrainer:
                 raise RuntimeError("[PLAN-B] Full model download failed")
         else:
             _plan_b_log(f"Using cached full model: {model_path}")
-        state_dict = torch.load(model_path, map_location="cpu", weights_only=True)
+        state_dict = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
         self.model = self._load_model_from_state_dict(state_dict)
         self.current_model_version = target_version
         _plan_b_log(f"Loaded full model v{target_version}")
