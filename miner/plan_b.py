@@ -470,6 +470,8 @@ class LocalTrainer:
             file_url = f"{mirror.rstrip('/')}/{model_filename}"
             _plan_b_log(f"[DOWNLOAD] Trying {file_url}")
             try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
                 total_bytes = miner_lib._stream_download_with_resume(file_url, tmp_path, timeout_s=600)
                 _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
                 os.replace(tmp_path, model_path)
@@ -480,6 +482,8 @@ class LocalTrainer:
             except Exception as exc:
                 last_error = exc
                 _plan_b_log(f"[DOWNLOAD] Mirror failed: {exc}")
+                with contextlib.suppress(FileNotFoundError):
+                    tmp_path.unlink()
 
         if last_error is not None:
             _plan_b_log("[DOWNLOAD] All mirrors failed, falling back to PS /model")
