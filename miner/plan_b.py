@@ -40,11 +40,10 @@ def _normalize_url(url: str) -> str:
     return str(url or "").strip().rstrip("/")
 
 
-DEFAULT_MODEL_QUEUE_BASE_URL = _normalize_url(os.environ.get("ALICE_MODEL_QUEUE_BASE_URL", "https://dl.aliceprotocol.org"))
-DOWNLOAD_QUEUE_POLL_S = max(5, int(os.environ.get("ALICE_MODEL_QUEUE_POLL_S", "30") or 30))
-DOWNLOAD_QUEUE_RETRY_S = max(5, int(os.environ.get("ALICE_MODEL_QUEUE_RETRY_S", "10") or 10))
-DOWNLOAD_QUEUE_HEARTBEAT_S = max(15, int(os.environ.get("ALICE_MODEL_QUEUE_HEARTBEAT_S", "60") or 60))
-MAX_QUEUE_POLL_FAILURES = max(1, int(os.environ.get("ALICE_MODEL_QUEUE_MAX_POLL_FAILURES", "5") or 5))
+MODEL_MIRRORS = [
+    "https://huggingface.co/v102ss/alice-7b-model/resolve/main",
+    "https://dl.aliceprotocol.org/models",
+]
 
 
 def _extract_tokens(shard_data: Any) -> torch.Tensor:
@@ -102,7 +101,6 @@ class LocalTrainer:
         self._status_cache: Optional[Dict[str, Any]] = None
         self._status_cache_ts: float = 0.0
         self.epoch_start_time: float = time.time()
-        self.model_queue_base_url = DEFAULT_MODEL_QUEUE_BASE_URL
 
     def mark_epoch_start(self) -> None:
         self.epoch_start_time = time.time()
@@ -463,168 +461,29 @@ class LocalTrainer:
         if not ok:
             raise RuntimeError(f"[PLAN-B] Full model download failed for version {version}")
 
-    def _queue_join(self, queue_url: str) -> Optional[Dict[str, Any]]:
-        payload = {
-            "address": self.miner_address,
-            "instance_id": self.miner_instance_id,
-        }
-        try:
-            resp = requests.post(queue_url, json=payload, timeout=10)
-            if resp.status_code != 200:
-                _plan_b_log(f"Queue unavailable ({resp.status_code}), falling back to /model download")
-                return None
-            data = resp.json()
-        except requests.RequestException as exc:
-            _plan_b_log(f"Queue service unreachable ({exc}), falling back to /model download")
-            return None
-        except ValueError as exc:
-            _plan_b_log(f"Queue returned invalid JSON ({exc}), falling back to /model download")
-            return None
-        if not str(data.get("queue_id", "")).strip():
-            _plan_b_log("Queue response missing queue_id, falling back to /model download")
-            return None
-        return data
-
-    def _start_download_queue_heartbeat(self, queue_url: str, download_token: str) -> threading.Event:
-        stop_event = threading.Event()
-
-        def _heartbeat_loop() -> None:
-            while not stop_event.wait(DOWNLOAD_QUEUE_HEARTBEAT_S):
-                try:
-                    requests.post(
-                        f"{queue_url}/heartbeat",
-                        json={"download_token": download_token},
-                        timeout=5,
-                    )
-                except Exception:
-                    # Heartbeat is best-effort; the lease will expire if the queue cannot be reached.
-                    pass
-
-        thread = threading.Thread(
-            target=_heartbeat_loop,
-            daemon=True,
-            name="plan_b_download_queue_heartbeat",
-        )
-        thread.start()
-        return stop_event
-
-    def _complete_download_queue(self, queue_url: str, queue_id: str, download_token: str) -> None:
-        with contextlib.suppress(Exception):
-            requests.post(
-                f"{queue_url}/complete",
-                json={
-                    "queue_id": queue_id,
-                    "download_token": download_token,
-                },
-                timeout=5,
-            )
-
-    def _fallback_from_queue_wait(self, queue_url: str, queue_id: str, version: int, model_path: Path, reason: str) -> None:
-        _plan_b_log(reason)
-        self._complete_download_queue(queue_url, queue_id, "")
-        self._download_full_model_direct(version, model_path)
-
-    def _download_full_model_static(self, version: int, model_path: Path, download_token: str) -> None:
+    def _download_full_model_from_mirrors(self, version: int, model_path: Path) -> None:
         model_filename = f"v{version}_full.pt"
-        file_url = f"{self.model_queue_base_url}/models/{model_filename}?token={download_token}"
         tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
-        total_bytes = miner_lib._stream_download_with_resume(file_url, tmp_path, timeout_s=600)
-        _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
-        os.replace(tmp_path, model_path)
-        _plan_b_log(f"Static full model download complete: {total_bytes / 1e9:.2f} GB")
+        last_error: Optional[Exception] = None
 
-    def _download_full_model_queued(self, version: int, model_path: Path) -> None:
-        queue_url = f"{self.model_queue_base_url}/models/queue"
-        data = self._queue_join(queue_url)
-        if data is None:
-            self._download_full_model_direct(version, model_path)
-            return
-
-        queue_id = str(data.get("queue_id", "")).strip()
-        consecutive_poll_failures = 0
-        while True:
-            position = int(data.get("position", -1) or -1)
-            if position == 0:
-                download_token = str(data.get("download_token", "")).strip()
-                if not download_token:
-                    _plan_b_log("Queue returned no download token, falling back to /model download")
-                    self._download_full_model_direct(version, model_path)
-                    return
-
-                print("✅ Download slot acquired, starting download...")
-                heartbeat_stop = self._start_download_queue_heartbeat(queue_url, download_token)
-                try:
-                    self._download_full_model_static(version, model_path, download_token)
-                    return
-                except Exception as exc:
-                    _plan_b_log(f"Queued static download failed ({exc}), falling back to /model download")
-                finally:
-                    heartbeat_stop.set()
-                    self._complete_download_queue(queue_url, queue_id, download_token)
-                self._download_full_model_direct(version, model_path)
-                return
-
-            if position < 0 or str(data.get("status", "")).strip().lower() == "not_found":
-                _plan_b_log("Queue ticket expired or queue state was reset, rejoining queue")
-                data = self._queue_join(queue_url)
-                if data is None:
-                    self._download_full_model_direct(version, model_path)
-                    return
-                queue_id = str(data.get("queue_id", "")).strip()
-                consecutive_poll_failures = 0
-                continue
-
-            wait_seconds = max(0, int(data.get("wait_seconds", DOWNLOAD_QUEUE_POLL_S) or DOWNLOAD_QUEUE_POLL_S))
-            print(f"⏳ Download queue: position #{position} (~{wait_seconds // 60} min)")
-            time.sleep(DOWNLOAD_QUEUE_POLL_S)
+        for mirror in MODEL_MIRRORS:
+            file_url = f"{mirror.rstrip('/')}/{model_filename}"
+            _plan_b_log(f"[DOWNLOAD] Trying {file_url}")
             try:
-                resp = requests.get(queue_url, params={"queue_id": queue_id}, timeout=10)
-                if resp.status_code == 404:
-                    data = {"status": "not_found", "position": -1}
-                    consecutive_poll_failures = 0
-                    continue
-                if resp.status_code != 200:
-                    consecutive_poll_failures += 1
-                    print("[DOWNLOAD] Queue check failed, retrying...")
-                    if consecutive_poll_failures >= MAX_QUEUE_POLL_FAILURES:
-                        self._fallback_from_queue_wait(
-                            queue_url,
-                            queue_id,
-                            version,
-                            model_path,
-                            f"Queue polling failed {MAX_QUEUE_POLL_FAILURES} times, falling back to /model download",
-                        )
-                        return
-                    time.sleep(DOWNLOAD_QUEUE_RETRY_S)
-                    continue
-                data = resp.json()
-                consecutive_poll_failures = 0
-            except ValueError:
-                consecutive_poll_failures += 1
-                print("[DOWNLOAD] Queue returned invalid JSON, retrying...")
-                if consecutive_poll_failures >= MAX_QUEUE_POLL_FAILURES:
-                    self._fallback_from_queue_wait(
-                        queue_url,
-                        queue_id,
-                        version,
-                        model_path,
-                        f"Queue polling returned invalid JSON {MAX_QUEUE_POLL_FAILURES} times, falling back to /model download",
-                    )
-                    return
-                time.sleep(DOWNLOAD_QUEUE_RETRY_S)
-            except requests.RequestException:
-                consecutive_poll_failures += 1
-                print("[DOWNLOAD] Queue check failed, retrying...")
-                if consecutive_poll_failures >= MAX_QUEUE_POLL_FAILURES:
-                    self._fallback_from_queue_wait(
-                        queue_url,
-                        queue_id,
-                        version,
-                        model_path,
-                        f"Queue polling failed {MAX_QUEUE_POLL_FAILURES} times, falling back to /model download",
-                    )
-                    return
-                time.sleep(DOWNLOAD_QUEUE_RETRY_S)
+                total_bytes = miner_lib._stream_download_with_resume(file_url, tmp_path, timeout_s=600)
+                _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
+                os.replace(tmp_path, model_path)
+                _plan_b_log(
+                    f"[DOWNLOAD] Full model mirror download complete: {total_bytes / 1e9:.2f} GB"
+                )
+                return
+            except Exception as exc:
+                last_error = exc
+                _plan_b_log(f"[DOWNLOAD] Mirror failed: {exc}")
+
+        if last_error is not None:
+            _plan_b_log("[DOWNLOAD] All mirrors failed, falling back to PS /model")
+        self._download_full_model_direct(version, model_path)
 
     def _find_best_local_model(self, target_version: Optional[int]) -> Optional[int]:
         marker_version = self._read_local_version_marker()
@@ -699,7 +558,7 @@ class LocalTrainer:
         model_path = self._full_model_path(target_version)
         if not model_path.exists():
             _plan_b_log(f"Downloading full model for version {target_version}")
-            self._download_full_model_queued(target_version, model_path)
+            self._download_full_model_from_mirrors(target_version, model_path)
         else:
             _plan_b_log(f"Using cached full model: {model_path}")
         state_dict = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
