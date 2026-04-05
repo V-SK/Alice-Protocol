@@ -4,6 +4,7 @@
 import contextlib
 import gc
 import io
+import json
 import os
 import tempfile
 import threading
@@ -159,6 +160,73 @@ class LocalTrainer:
             return int(value) if value else None
         except Exception:
             return None
+
+    def _spool_dir(self, model_version: Optional[int] = None) -> Path:
+        version = int(model_version if model_version is not None else self.current_model_version or 0)
+        return self.delta_outbox_dir / f"v{version}"
+
+    def _spool_manifest_path(self, spool_dir: Optional[Path] = None) -> Path:
+        return (spool_dir or self._spool_dir()) / "manifest.json"
+
+    def _write_spool_manifest(self, manifest: Dict[str, Any]) -> None:
+        serializable = dict(manifest)
+        serializable["layer_files"] = [
+            Path(str(path)).name
+            for path in (manifest.get("layer_files") or [])
+        ]
+        manifest_path = Path(str(serializable["manifest_path"]))
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+        encoded = json.dumps(serializable, indent=2, sort_keys=True)
+        tmp_path.write_text(encoded, encoding="utf-8")
+        os.replace(tmp_path, manifest_path)
+
+    def _read_spool_manifest(self, manifest_path: Path) -> Optional[Dict[str, Any]]:
+        try:
+            data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except Exception:
+            return None
+        if not isinstance(data, dict):
+            return None
+        spool_dir = manifest_path.parent
+        layer_files = data.get("layer_files") or []
+        if not isinstance(layer_files, list):
+            return None
+        materialized_files: List[str] = []
+        for file_name in layer_files:
+            path = spool_dir / str(file_name)
+            if not path.exists():
+                return None
+            materialized_files.append(str(path))
+        data["spool_dir"] = str(spool_dir)
+        data["manifest_path"] = str(manifest_path)
+        data["layer_files"] = materialized_files
+        return data
+
+    def recover_pending_delta(self) -> Optional[Dict[str, Any]]:
+        manifests = sorted(
+            self.delta_outbox_dir.glob("v*/manifest.json"),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        for manifest_path in manifests:
+            manifest = self._read_spool_manifest(manifest_path)
+            if manifest is None:
+                continue
+            if str(manifest.get("state") or "pending_upload") == "uploaded":
+                continue
+            return manifest
+        return None
+
+    def _cleanup_spool(self, metadata: Dict[str, Any]) -> None:
+        spool_dir = Path(str(metadata.get("spool_dir") or ""))
+        if not spool_dir.exists():
+            return
+        for path in sorted(spool_dir.glob("*"), reverse=True):
+            with contextlib.suppress(Exception):
+                path.unlink()
+        with contextlib.suppress(Exception):
+            spool_dir.rmdir()
 
     def _headers(self) -> Dict[str, str]:
         return miner_lib._auth_headers(self.token)
@@ -359,16 +427,29 @@ class LocalTrainer:
     def compute_and_compress_delta(self) -> Dict[str, Any]:
         if self.model is None:
             raise RuntimeError("Plan B model is not initialized")
+        if self.current_model_version is None:
+            raise RuntimeError("Plan B current model version is unknown")
+        existing = self.recover_pending_delta()
+        if existing is not None and int(existing.get("model_version", -1) or -1) == int(self.current_model_version):
+            _plan_b_log(
+                f"Reusing pending delta spool for model v{self.current_model_version}: "
+                f"{existing.get('spool_dir')}"
+            )
+            return existing
+
         total_entries = 0
         total_bytes = 0
         total_norm_sq = 0.0
         delta_norm_per_layer: Dict[str, float] = {}
         layer_files: List[str] = []
         ratio = float(getattr(self.args, "delta_compression_ratio", 0.005) or 0.005)
-
-        for path in self.delta_outbox_dir.glob("*.pt"):
-            with contextlib.suppress(Exception):
-                path.unlink()
+        spool_dir = self._spool_dir(self.current_model_version)
+        if spool_dir.exists():
+            for path in spool_dir.glob("*"):
+                with contextlib.suppress(Exception):
+                    path.unlink()
+        spool_dir.mkdir(parents=True, exist_ok=True)
+        manifest_path = self._spool_manifest_path(spool_dir)
 
         for name, param in self.model.named_parameters():
             global_param = self.load_global_param(name)
@@ -389,26 +470,43 @@ class LocalTrainer:
                 "shape": tuple(param.shape),
             }
             safe_name = _safe_layer_name(name)
-            output_path = self.delta_outbox_dir / f"{safe_name}.pt"
+            output_path = spool_dir / f"{safe_name}.pt"
             torch.save(payload, output_path)
             total_entries += int(topk_idx.numel())
             total_bytes += output_path.stat().st_size
-            layer_files.append(str(output_path))
+            layer_files.append(output_path.name)
 
         delta_norm = total_norm_sq ** 0.5
-        _plan_b_log(
-            f"Compressed delta: layers={len(layer_files)}, entries={total_entries}, bytes={total_bytes}, norm={delta_norm:.4f}"
-        )
-        return {
+        metadata = {
+            "state": "pending_upload",
+            "created_at": time.time(),
+            "spool_dir": str(spool_dir),
+            "manifest_path": str(manifest_path),
+            "base_model_version": int(self.current_model_version),
+            "model_version": int(self.current_model_version),
             "total_entries": total_entries,
             "total_bytes": total_bytes,
             "delta_norm": delta_norm,
             "delta_norm_per_layer": delta_norm_per_layer,
             "layer_files": layer_files,
-            "model_version": self.current_model_version,
+            "completed_shards": 0,
+            "completed_effective_tokens": 0,
+            "batch_size": 0,
         }
+        self._write_spool_manifest(metadata)
+        materialized = self._read_spool_manifest(manifest_path)
+        if materialized is None:
+            raise RuntimeError("Failed to materialize delta spool manifest")
+        _plan_b_log(
+            f"Compressed delta: layers={len(layer_files)}, entries={total_entries}, bytes={total_bytes}, "
+            f"norm={delta_norm:.4f}, spool={spool_dir}"
+        )
+        return materialized
 
     def submit_delta(self, metadata: Dict[str, Any]) -> bool:
+        manifest = dict(metadata)
+        manifest["state"] = "uploading"
+        self._write_spool_manifest(manifest)
         layer_files = metadata.get("layer_files") or []
         for filepath in layer_files:
             layer_name = Path(filepath).stem
@@ -427,10 +525,14 @@ class LocalTrainer:
                     )
                 if resp.status_code in (404, 501):
                     _plan_b_log(f"Delta upload endpoint unavailable ({resp.status_code}); deferring until Day 2")
+                    manifest["state"] = "pending_upload"
+                    self._write_spool_manifest(manifest)
                     return False
                 resp.raise_for_status()
             except Exception as exc:
                 _plan_b_log(f"Delta upload failed for {layer_name}: {exc}")
+                manifest["state"] = "pending_upload"
+                self._write_spool_manifest(manifest)
                 return False
 
         finalize_payload = {
@@ -450,12 +552,19 @@ class LocalTrainer:
             )
             if resp.status_code in (404, 501):
                 _plan_b_log(f"Delta finalize endpoint unavailable ({resp.status_code}); deferring until Day 2")
+                manifest["state"] = "pending_upload"
+                self._write_spool_manifest(manifest)
                 return False
             resp.raise_for_status()
         except Exception as exc:
             _plan_b_log(f"Delta finalize failed: {exc}")
+            manifest["state"] = "pending_upload"
+            self._write_spool_manifest(manifest)
             return False
 
+        manifest["state"] = "uploaded"
+        self._write_spool_manifest(manifest)
+        self._cleanup_spool(manifest)
         _plan_b_log("Delta upload complete")
         return True
 
@@ -534,7 +643,7 @@ class LocalTrainer:
             status.get("version"),
             status.get("current_version"),
         ) or 0
-        bootstrap_version = _pick_first_version(
+        published_full_version = _pick_first_version(
             info.get("published_full_version"),
             info.get("version"),
             target_version,
@@ -544,7 +653,7 @@ class LocalTrainer:
             target_version,
         ) or target_version
         if target_version > 0:
-            bootstrap_version = max(0, min(bootstrap_version, target_version))
+            published_full_version = max(0, min(published_full_version, target_version))
             published_update_version = max(0, min(published_update_version, target_version))
 
         full_model_base_urls = _parse_url_candidates(info.get("full_model_base_urls"))
@@ -559,7 +668,8 @@ class LocalTrainer:
             "status": status,
             "info": info,
             "target_version": target_version,
-            "bootstrap_version": bootstrap_version,
+            "bootstrap_version": published_full_version,
+            "published_full_version": published_full_version,
             "published_update_version": published_update_version,
             "full_model_base_urls": full_model_base_urls,
             "epoch_update_base_urls": epoch_update_base_urls,
@@ -585,8 +695,6 @@ class LocalTrainer:
             file_url = f"{mirror.rstrip('/')}/{model_filename}"
             _plan_b_log(f"[DOWNLOAD] Trying {file_url}")
             try:
-                if tmp_path.exists():
-                    tmp_path.unlink()
                 total_bytes = miner_lib._stream_download_with_resume(file_url, tmp_path, timeout_s=600)
                 _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
                 os.replace(tmp_path, model_path)
@@ -597,8 +705,6 @@ class LocalTrainer:
             except Exception as exc:
                 last_error = exc
                 _plan_b_log(f"[DOWNLOAD] Mirror failed: {exc}")
-                with contextlib.suppress(FileNotFoundError):
-                    tmp_path.unlink()
 
         if last_error is not None:
             _plan_b_log("[DOWNLOAD] All mirrors failed, falling back to PS /model")
@@ -626,8 +732,6 @@ class LocalTrainer:
             file_url = f"{base_url.rstrip('/')}/update_v{version}.pt"
             _plan_b_log(f"[DOWNLOAD] Trying epoch update mirror {file_url}")
             try:
-                with contextlib.suppress(FileNotFoundError):
-                    tmp_path.unlink()
                 total_bytes = miner_lib._stream_download_with_resume(file_url, tmp_path, timeout_s=600)
                 update = self._load_epoch_update_from_path(tmp_path)
                 os.replace(tmp_path, update_path)
@@ -637,39 +741,28 @@ class LocalTrainer:
                 return update
             except Exception as exc:
                 _plan_b_log(f"[DOWNLOAD] Epoch update mirror failed: {exc}")
-                with contextlib.suppress(FileNotFoundError):
-                    tmp_path.unlink()
         return None
 
     def _download_epoch_update_from_ps(self, from_version: int, version: int) -> Optional[Dict[str, Any]]:
         update_path = self._epoch_update_path(version)
         tmp_path = update_path.with_suffix(update_path.suffix + ".tmp")
         try:
-            with requests.get(
-                f"{self.ps_url}/model/epoch_update",
-                params={"from_version": from_version},
-                headers=self._headers(),
-                timeout=600,
-                stream=True,
-            ) as resp:
-                if resp.status_code in (404, 501):
+            url = f"{self.ps_url.rstrip('/')}/model/epoch_update?from_version={int(from_version)}"
+            try:
+                total_bytes = miner_lib._stream_download_with_resume(url, tmp_path, timeout_s=600)
+            except requests.HTTPError as exc:
+                response = exc.response
+                if response is not None and response.status_code in (404, 501):
                     _plan_b_log("Epoch update endpoint unavailable; using local model until next retry")
                     return None
-                if resp.status_code == 410:
+                if response is not None and response.status_code == 410:
                     raise RuntimeError("expired")
-                resp.raise_for_status()
-
-                with contextlib.suppress(FileNotFoundError):
-                    tmp_path.unlink()
-                with open(tmp_path, "wb") as handle:
-                    for chunk in resp.iter_content(chunk_size=1024 * 1024):
-                        if not chunk:
-                            continue
-                        handle.write(chunk)
-
+                raise
             update = self._load_epoch_update_from_path(tmp_path)
             os.replace(tmp_path, update_path)
-            _plan_b_log(f"[DOWNLOAD] Epoch update fallback download complete: v{version}")
+            _plan_b_log(
+                f"[DOWNLOAD] Epoch update fallback download complete: v{version} {total_bytes / 1e6:.1f} MB"
+            )
             return update
         except RuntimeError:
             raise
@@ -685,15 +778,25 @@ class LocalTrainer:
 
         named_params = dict(self.model.named_parameters())
         with torch.no_grad():
-            for chunk in update.get("chunks", []):
-                name = chunk.get("name")
-                param = named_params.get(name)
-                if param is None:
-                    continue
-                indices = chunk["indices"].long()
-                values = chunk["values"].float()
-                param_flat = param.data.view(-1)
-                param_flat[indices.to(param.device)] += values.to(param.device)
+            chunks = update.get("chunks", [])
+            if isinstance(chunks, list) and chunks:
+                for chunk in chunks:
+                    name = chunk.get("name")
+                    param = named_params.get(name)
+                    if param is None:
+                        continue
+                    indices = chunk["indices"].long()
+                    values = chunk["values"].float()
+                    param_flat = param.data.view(-1)
+                    param_flat[indices.to(param.device)] += values.to(param.device)
+            else:
+                for name, delta in update.items():
+                    if name in {"old_version", "new_version", "chunks"}:
+                        continue
+                    param = named_params.get(name)
+                    if param is None or not torch.is_tensor(delta):
+                        continue
+                    param.data.add_(delta.to(param.device, dtype=param.dtype))
         self.current_model_version = int(update.get("new_version", from_version + 1))
         self._write_local_version_marker(self.current_model_version)
         _plan_b_log(f"Applied sparse epoch update v{self.current_model_version}")
@@ -941,13 +1044,29 @@ def confirm_shard_complete(
 
 def wait_for_next_epoch(trainer: LocalTrainer, poll_interval_s: int = 15) -> None:
     start_version = trainer.current_model_version
-    for _ in range(max(1, SUBMIT_WINDOW_S // poll_interval_s)):
+    if start_version is None:
+        return
+    waited_s = 0
+    while True:
         time.sleep(poll_interval_s)
-        latest = trainer._current_ps_model_version()
-        if latest is not None and start_version is not None and latest > start_version:
-            _plan_b_log(f"Detected new model version {latest}, continuing")
+        waited_s += poll_interval_s
+        publication = trainer._publication_state(force=True)
+        published_update_version = int(publication.get("published_update_version") or 0)
+        published_full_version = int(publication.get("published_full_version") or 0)
+        if max(published_update_version, published_full_version) > int(start_version):
+            _plan_b_log(
+                f"Detected published next version: full={published_full_version}, "
+                f"update={published_update_version}, local={start_version}"
+            )
             return
-    _plan_b_log("Waited for next epoch window; continuing with best-effort local timing")
+        if waited_s >= SUBMIT_WINDOW_S:
+            live_version = int(publication.get("target_version") or 0)
+            _plan_b_log(
+                f"Still waiting for published next version after {waited_s}s: "
+                f"live={live_version}, published_full={published_full_version}, "
+                f"published_update={published_update_version}, local={start_version}"
+            )
+            waited_s = 0
 
 
 def run_plan_b(args: Any) -> None:
@@ -996,6 +1115,13 @@ def run_plan_b(args: Any) -> None:
                 args=args,
                 miner_instance_id=miner_instance_id,
             )
+            pending_delta = trainer.recover_pending_delta()
+            if pending_delta is not None:
+                _plan_b_log(f"Found pending delta spool at startup: {pending_delta.get('spool_dir')}")
+                if not trainer.submit_delta(pending_delta):
+                    _plan_b_log("Pending delta upload failed at startup; re-registering before training")
+                    time.sleep(10)
+                    continue
             trainer.apply_epoch_updates()
             heartbeat_stop, heartbeat_re_register, _thread = miner_lib.start_heartbeat_loop(
                 runtime_auth_state,
@@ -1005,6 +1131,12 @@ def run_plan_b(args: Any) -> None:
                 if heartbeat_re_register is not None and heartbeat_re_register.is_set():
                     _plan_b_log("Heartbeat requested re-registration")
                     break
+                pending_delta = trainer.recover_pending_delta()
+                if pending_delta is not None:
+                    _plan_b_log(f"Retrying pending delta spool before next epoch: {pending_delta.get('spool_dir')}")
+                    if not trainer.submit_delta(pending_delta):
+                        _plan_b_log("Pending delta upload still failing; re-registering before new epoch")
+                        break
                 trainer.mark_epoch_start()
                 trainer.apply_epoch_updates()
                 trainer.save_global_snapshot()
@@ -1081,6 +1213,7 @@ def run_plan_b(args: Any) -> None:
                         f"completed_effective_tokens={completed_effective_tokens}, "
                         f"reporting average batch_size={metadata['batch_size']}"
                     )
+                trainer._write_spool_manifest(dict(metadata))
                 success = trainer.submit_delta(metadata)
                 if not success:
                     _plan_b_log("Delta upload failed, re-registering and retrying once")
@@ -1102,6 +1235,13 @@ def run_plan_b(args: Any) -> None:
                         if new_token:
                             auth_token = new_token
                             trainer.token = new_token
+                            miner_lib._update_runtime_auth_state(
+                                runtime_auth_state,
+                                data_plane_url=data_plane_url,
+                                miner_id=miner_instance_id,
+                                capabilities=capabilities,
+                                auth_token=new_token,
+                            )
                             success = trainer.submit_delta(metadata)
                             if success:
                                 _plan_b_log("Delta upload succeeded after re-register")

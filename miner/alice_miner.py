@@ -1497,33 +1497,15 @@ def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[
     print("📥 Downloading model (streaming)...")
     
     try:
-        with requests.get(
-            f"{ps_url}/model",
-            stream=True,
-            headers=_auth_headers(auth_token),
-            timeout=300, # 5min for cross-region shard download
-        ) as resp:
-            resp.raise_for_status()
-            
-            # Stream to temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as tmp:
-                total_bytes = 0
-                for chunk in resp.iter_content(chunk_size=8192):
-                    tmp.write(chunk)
-                    total_bytes += len(chunk)
-                    if total_bytes % (10 * 1024 * 1024) == 0:  # Every 10MB
-                        print(f"   Downloaded {total_bytes / 1e6:.1f} MB...")
-                
-                tmp_path = tmp.name
-        
-        # Load from temp file with weights_only=True (security)
-        print(f"📦 Loading model from disk ({total_bytes / 1e6:.1f} MB)...")
-        state_dict = torch.load(tmp_path, map_location='cpu', weights_only=True)
-        
-        # Save to final location
-        torch.save(state_dict, save_path)
-        os.remove(tmp_path)
-        
+        tmp_path = save_path.with_suffix(save_path.suffix + ".tmp")
+        total_bytes = _stream_download_with_resume(
+            f"{ps_url.rstrip('/')}/model",
+            tmp_path,
+            timeout_s=600,
+        )
+        print(f"📦 Validating model from disk ({total_bytes / 1e6:.1f} MB)...")
+        _ = torch.load(tmp_path, map_location='cpu', mmap=True, weights_only=True)
+        os.replace(tmp_path, save_path)
         print(f"✅ Model saved to {save_path}")
         return True
         
@@ -1749,8 +1731,10 @@ def start_heartbeat_loop(
     """Keep runtime miner registration alive during long downloads/training."""
     stop_event = threading.Event()
     re_register_event = threading.Event()
+    fail_threshold = max(1, int(os.getenv("ALICE_HEARTBEAT_FAIL_THRESHOLD", "3")))
 
     def _heartbeat_loop() -> None:
+        consecutive_failures = 0
         while not stop_event.wait(interval_s):
             snapshot = _read_runtime_auth_state(runtime_auth_state)
             status = send_heartbeat(
@@ -1764,7 +1748,17 @@ def start_heartbeat_loop(
                 re_register_event.set()
                 return
             if status != "ok":
-                print(f"⚠️ Heartbeat failed for runtime endpoint {snapshot['data_plane_url']}")
+                consecutive_failures += 1
+                print(
+                    f"⚠️ Heartbeat failed for runtime endpoint {snapshot['data_plane_url']} "
+                    f"({consecutive_failures}/{fail_threshold})"
+                )
+                if consecutive_failures >= fail_threshold:
+                    print("⚠️ Heartbeat failed repeatedly, forcing re-register")
+                    re_register_event.set()
+                    return
+                continue
+            consecutive_failures = 0
 
     thread = threading.Thread(
         target=_heartbeat_loop,
@@ -1896,20 +1890,35 @@ def _parse_base_urls(info: Dict[str, Any], fallback_base: str) -> List[str]:
     return urls
 
 
-def _stream_download_with_resume(file_url: str, tmp_path: Path, timeout_s: int = 600) -> int:
+def _stream_download_with_resume(
+    file_url: str,
+    tmp_path: Path,
+    timeout_s: int = 600,
+    *,
+    headers: Optional[Dict[str, str]] = None,
+    method: str = "GET",
+    json_body: Optional[Dict[str, Any]] = None,
+) -> int:
     """Download file with HTTP Range resume support into tmp_path.
 
     Returns current downloaded size in bytes (final file size on success).
     """
     downloaded = tmp_path.stat().st_size if tmp_path.exists() else 0
-    headers: Dict[str, str] = {}
+    request_headers: Dict[str, str] = dict(headers or {})
     mode = "wb"
     if downloaded > 0:
-        headers["Range"] = f"bytes={downloaded}-"
+        request_headers["Range"] = f"bytes={downloaded}-"
         mode = "ab"
         print(f"   ↩️ Resuming from {downloaded / 1e9:.2f} GB")
 
-    with requests.get(file_url, headers=headers, stream=True, timeout=timeout_s) as resp:
+    with requests.request(
+        method.upper(),
+        file_url,
+        headers=request_headers,
+        json=json_body,
+        stream=True,
+        timeout=timeout_s,
+    ) as resp:
         if downloaded > 0 and resp.status_code == 200:
             # Server ignored Range; restart from scratch to avoid corruption.
             print("   ⚠️ Server ignored Range, restarting download from 0")
@@ -1964,8 +1973,6 @@ def _download_partial_model_from_nginx(
         file_url = f"{base_url}/{file_name}"
         print(f"📥 Static model source {idx}/{len(base_urls)}: {file_url}")
         try:
-            with contextlib.suppress(FileNotFoundError):
-                tmp_path.unlink()
             # Cache hit: reuse same file if byte size matches.
             if model_path.exists():
                 with contextlib.suppress(Exception):
@@ -1985,8 +1992,6 @@ def _download_partial_model_from_nginx(
         except Exception as exc:
             last_error = exc
             print(f"⚠️ Static source failed ({file_url}): {exc}")
-            with contextlib.suppress(FileNotFoundError):
-                tmp_path.unlink()
             continue
 
     if last_error is not None:
@@ -2031,34 +2036,20 @@ def download_partial_model_with_retry(
 
             # Fallback path: existing PS route.
             tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
-            with requests.post(
-                f"{ps_url}/model/layers",
-                json={"assigned_layers": assigned_layers},
+            total_bytes = _stream_download_with_resume(
+                f"{ps_url.rstrip('/')}/model/layers",
+                tmp_path,
+                timeout_s=600,
                 headers=_auth_headers(auth_token),
-                stream=True,
-                timeout=600,
-            ) as resp:
-                resp.raise_for_status()
-                total_bytes = 0
-                with open(tmp_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=8192):
-                        if not chunk:
-                            continue
-                        f.write(chunk)
-                        total_bytes += len(chunk)
-                        if total_bytes % (100 * 1024 * 1024) == 0:
-                            print(f"   Downloaded {total_bytes / 1e9:.2f} GB...")
-
+                method="POST",
+                json_body={"assigned_layers": assigned_layers},
+            )
             _ = torch.load(tmp_path, map_location="cpu", mmap=True, weights_only=True)
             os.replace(tmp_path, model_path)
             return True, total_bytes
 
         except Exception as e:
             print(f"⚠️ Model download failed, retrying... ({attempt}/{max_attempts}) error={e}")
-            with contextlib.suppress(Exception):
-                tmp_path = model_path.with_suffix(model_path.suffix + ".tmp")
-                if tmp_path.exists():
-                    tmp_path.unlink()
             if attempt < max_attempts:
                 time.sleep(retry_delay)
 
