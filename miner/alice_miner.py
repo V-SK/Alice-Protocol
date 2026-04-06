@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 """
 Alice Miner Client V2 - Task-based Architecture with Tiered Training
 Requests tasks from PS, downloads shards on-demand, trains assigned layers, and submits gradients.
@@ -58,6 +60,7 @@ MAX_DELTA_HOPS = 10
 KEEP_VERSIONS = 2
 DEFAULT_MODEL_DIR = Path.home() / ".alice" / "models"
 ASSIGNMENT_CACHE_PATH = Path.home() / ".alice" / "assignment_cache.json"
+DOWNLOAD_TMP_DIR = Path.home() / ".alice" / "downloads"
 ASSIGNMENT_RETRY_ATTEMPTS = 3
 ASSIGNMENT_RETRY_DELAY_S = 5
 DIRECT_ASSIGNMENT_RECHECK_S = 300
@@ -494,6 +497,192 @@ def _auth_headers(auth_token: Optional[str]) -> Dict[str, str]:
     if not auth_token:
         return {}
     return {"Authorization": f"Bearer {auth_token}"}
+
+
+class AtomicTokenHolder:
+    """Thread-safe single source of truth for runtime auth/session identity."""
+
+    def __init__(
+        self,
+        token: Optional[str] = None,
+        miner_id: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        data_plane_url: Optional[str] = None,
+    ) -> None:
+        self._lock = threading.Lock()
+        self._token: Optional[str] = None
+        self._miner_id: Optional[str] = None
+        self._instance_id: Optional[str] = None
+        self._data_plane_url: Optional[str] = None
+        self._updated_at: float = 0.0
+        self.update(
+            token=token,
+            miner_id=miner_id,
+            instance_id=instance_id,
+            data_plane_url=data_plane_url,
+        )
+
+    def update(
+        self,
+        token: Optional[str],
+        miner_id: Optional[str] = None,
+        instance_id: Optional[str] = None,
+        data_plane_url: Optional[str] = None,
+    ) -> None:
+        with self._lock:
+            self._token = str(token or "").strip() or None
+            if miner_id is not None:
+                self._miner_id = str(miner_id).strip() or None
+            if instance_id is not None:
+                self._instance_id = str(instance_id).strip() or None
+            if data_plane_url is not None:
+                self._data_plane_url = _normalize_base_url(data_plane_url)
+            self._updated_at = time.time()
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "token": self._token,
+                "miner_id": self._miner_id,
+                "instance_id": self._instance_id,
+                "data_plane_url": self._data_plane_url,
+                "updated_at": self._updated_at,
+            }
+
+    @property
+    def token(self) -> Optional[str]:
+        with self._lock:
+            return self._token
+
+    @property
+    def miner_id(self) -> Optional[str]:
+        with self._lock:
+            return self._miner_id
+
+    @property
+    def instance_id(self) -> Optional[str]:
+        with self._lock:
+            return self._instance_id
+
+    @property
+    def data_plane_url(self) -> Optional[str]:
+        with self._lock:
+            return self._data_plane_url
+
+    @property
+    def updated_at(self) -> float:
+        with self._lock:
+            return self._updated_at
+
+    @property
+    def headers(self) -> Dict[str, str]:
+        with self._lock:
+            headers: Dict[str, str] = {}
+            if self._token:
+                headers["Authorization"] = f"Bearer {self._token}"
+            if self._miner_id:
+                headers["X-Miner-Id"] = self._miner_id
+            return headers
+
+
+class RuntimeSession:
+    """Shared runtime state for auth, routing, heartbeat, and re-registration."""
+
+    def __init__(
+        self,
+        data_plane_url: str,
+        miner_id: str,
+        capabilities: Dict[str, Any],
+        auth_token: Optional[str],
+        *,
+        instance_id: Optional[str] = None,
+    ) -> None:
+        self.auth = AtomicTokenHolder(
+            token=auth_token,
+            miner_id=miner_id,
+            instance_id=instance_id or miner_id,
+            data_plane_url=data_plane_url,
+        )
+        self._capabilities_lock = threading.Lock()
+        self._capabilities: Dict[str, Any] = dict(capabilities)
+        self.stop_event = threading.Event()
+        self.re_register_event = threading.Event()
+
+    def update(
+        self,
+        *,
+        data_plane_url: Optional[str] = None,
+        miner_id: Optional[str] = None,
+        capabilities: Optional[Dict[str, Any]] = None,
+        auth_token: Optional[str] = None,
+        instance_id: Optional[str] = None,
+    ) -> None:
+        next_token = self.auth.token if auth_token is None else auth_token
+        self.auth.update(
+            token=next_token,
+            miner_id=miner_id,
+            instance_id=instance_id,
+            data_plane_url=data_plane_url,
+        )
+        if capabilities is not None:
+            with self._capabilities_lock:
+                self._capabilities = dict(capabilities)
+
+    def reset_events(self) -> None:
+        self.stop_event = threading.Event()
+        self.re_register_event = threading.Event()
+
+    def request_re_register(self) -> None:
+        self.re_register_event.set()
+
+    @property
+    def token(self) -> Optional[str]:
+        return self.auth.token
+
+    @property
+    def miner_id(self) -> str:
+        return str(self.auth.miner_id or "")
+
+    @property
+    def instance_id(self) -> str:
+        return str(self.auth.instance_id or "")
+
+    @property
+    def data_plane_url(self) -> str:
+        return str(self.auth.data_plane_url or "")
+
+    @property
+    def headers(self) -> Dict[str, str]:
+        return self.auth.headers
+
+    @property
+    def capabilities(self) -> Dict[str, Any]:
+        with self._capabilities_lock:
+            return dict(self._capabilities)
+
+    def snapshot(self) -> Dict[str, Any]:
+        snapshot = self.auth.snapshot()
+        snapshot["capabilities"] = self.capabilities
+        return snapshot
+
+
+def _coerce_runtime_session(state: Any) -> RuntimeSession:
+    if isinstance(state, RuntimeSession):
+        return state
+    if isinstance(state, dict):
+        cached = state.get("_runtime_session")
+        if isinstance(cached, RuntimeSession):
+            return cached
+        session = RuntimeSession(
+            str(state.get("data_plane_url") or ""),
+            str(state.get("miner_id") or ""),
+            dict(state.get("capabilities") or {}),
+            state.get("auth_token"),
+            instance_id=str(state.get("instance_id") or state.get("miner_id") or ""),
+        )
+        state["_runtime_session"] = session
+        return session
+    raise TypeError(f"Unsupported runtime auth state: {type(state)!r}")
 
 
 def _normalize_base_url(url: str) -> str:
@@ -1502,6 +1691,7 @@ def download_model_streaming(ps_url: str, save_path: Path, auth_token: Optional[
             f"{ps_url.rstrip('/')}/model",
             tmp_path,
             timeout_s=600,
+            headers=_auth_headers(auth_token),
         )
         print(f"📦 Validating model from disk ({total_bytes / 1e6:.1f} MB)...")
         _ = torch.load(tmp_path, map_location='cpu', mmap=True, weights_only=True)
@@ -1659,15 +1849,14 @@ def _new_runtime_auth_state(
     miner_id: str,
     capabilities: Dict[str, Any],
     auth_token: Optional[str],
-) -> Dict[str, Any]:
-    lock = threading.Lock()
-    return {
-        "lock": lock,
-        "data_plane_url": str(data_plane_url),
-        "miner_id": str(miner_id),
-        "capabilities": dict(capabilities),
-        "auth_token": str(auth_token or "").strip(),
-    }
+) -> RuntimeSession:
+    return RuntimeSession(
+        data_plane_url,
+        miner_id,
+        capabilities,
+        auth_token,
+        instance_id=miner_id,
+    )
 
 
 def _build_runtime_auth_state(
@@ -1675,7 +1864,7 @@ def _build_runtime_auth_state(
     miner_id: str,
     capabilities: Dict[str, Any],
     auth_token: Optional[str],
-) -> Dict[str, Any]:
+) -> RuntimeSession:
     """Backward-compatible alias for older Plan B callers."""
     return _new_runtime_auth_state(
         data_plane_url,
@@ -1686,35 +1875,37 @@ def _build_runtime_auth_state(
 
 
 def _update_runtime_auth_state(
-    state: Dict[str, Any],
+    state: Any,
     *,
     data_plane_url: Optional[str] = None,
     miner_id: Optional[str] = None,
     capabilities: Optional[Dict[str, Any]] = None,
     auth_token: Optional[str] = None,
+    instance_id: Optional[str] = None,
 ) -> None:
-    with state["lock"]:
-        if data_plane_url is not None:
-            state["data_plane_url"] = str(data_plane_url)
-        if miner_id is not None:
-            state["miner_id"] = str(miner_id)
-        if capabilities is not None:
-            state["capabilities"] = dict(capabilities)
-        if auth_token is not None:
-            state["auth_token"] = str(auth_token or "").strip()
+    session = _coerce_runtime_session(state)
+    session.update(
+        data_plane_url=data_plane_url,
+        miner_id=miner_id,
+        capabilities=capabilities,
+        auth_token=auth_token,
+        instance_id=instance_id,
+    )
 
 
-def _read_runtime_auth_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    with state["lock"]:
-        return {
-            "data_plane_url": str(state["data_plane_url"]),
-            "miner_id": str(state["miner_id"]),
-            "capabilities": dict(state["capabilities"]),
-            "auth_token": str(state["auth_token"]),
-        }
+def _read_runtime_auth_state(state: Any) -> Dict[str, Any]:
+    session = _coerce_runtime_session(state)
+    snapshot = session.snapshot()
+    return {
+        "data_plane_url": str(snapshot.get("data_plane_url") or ""),
+        "miner_id": str(snapshot.get("miner_id") or ""),
+        "instance_id": str(snapshot.get("instance_id") or ""),
+        "capabilities": dict(snapshot.get("capabilities") or {}),
+        "auth_token": str(snapshot.get("token") or ""),
+    }
 
 
-def send_runtime_heartbeat(state: Dict[str, Any]) -> str:
+def send_runtime_heartbeat(state: Any) -> str:
     snapshot = _read_runtime_auth_state(state)
     return send_heartbeat(
         snapshot["data_plane_url"],
@@ -1725,18 +1916,20 @@ def send_runtime_heartbeat(state: Dict[str, Any]) -> str:
 
 
 def start_heartbeat_loop(
-    runtime_auth_state: Dict[str, Any],
+    runtime_auth_state: Any,
     interval_s: int = 60,
 ) -> tuple[threading.Event, threading.Event, threading.Thread]:
     """Keep runtime miner registration alive during long downloads/training."""
-    stop_event = threading.Event()
-    re_register_event = threading.Event()
+    session = _coerce_runtime_session(runtime_auth_state)
+    session.reset_events()
+    stop_event = session.stop_event
+    re_register_event = session.re_register_event
     fail_threshold = max(1, int(os.getenv("ALICE_HEARTBEAT_FAIL_THRESHOLD", "3")))
 
     def _heartbeat_loop() -> None:
         consecutive_failures = 0
         while not stop_event.wait(interval_s):
-            snapshot = _read_runtime_auth_state(runtime_auth_state)
+            snapshot = _read_runtime_auth_state(session)
             status = send_heartbeat(
                 snapshot["data_plane_url"],
                 snapshot["miner_id"],
@@ -1745,7 +1938,7 @@ def start_heartbeat_loop(
             )
             if status == "re_register":
                 print(f"⚠️ Runtime auth rejected on heartbeat, re-registering miner...")
-                re_register_event.set()
+                session.request_re_register()
                 return
             if status != "ok":
                 consecutive_failures += 1
@@ -1755,7 +1948,7 @@ def start_heartbeat_loop(
                 )
                 if consecutive_failures >= fail_threshold:
                     print("⚠️ Heartbeat failed repeatedly, forcing re-register")
-                    re_register_event.set()
+                    session.request_re_register()
                     return
                 continue
             consecutive_failures = 0
@@ -1936,6 +2129,11 @@ def _stream_download_with_resume(
                 if downloaded % (100 * 1024 * 1024) == 0:
                     print(f"   Downloaded {downloaded / 1e9:.2f} GB...")
     return downloaded
+
+
+def _shard_download_tmp_path(shard_id: int) -> Path:
+    DOWNLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    return DOWNLOAD_TMP_DIR / f"shard_{int(shard_id)}.pt.part"
 
 
 def _download_partial_model_from_nginx(
@@ -2234,28 +2432,19 @@ def _emit_miner_epoch_report(report_dir: Path, ps_url: str, stats: Optional[Dict
 
 
 def download_shard_streaming(ps_url: str, shard_id: int, auth_token: Optional[str] = None) -> Optional[Dict]:
-    """Download a single shard using streaming."""
+    """Download a single shard using resume-capable streaming."""
     try:
-        with requests.get(
-            f"{ps_url}/task/shard/{shard_id}",
-            stream=True,
+        tmp_path = _shard_download_tmp_path(shard_id)
+        _stream_download_with_resume(
+            f"{ps_url.rstrip('/')}/task/shard/{int(shard_id)}",
+            tmp_path,
+            timeout_s=300,
             headers=_auth_headers(auth_token),
-            timeout=300, # 5min for cross-region shard download
-        ) as resp:
-            resp.raise_for_status()
-            
-            # Stream to temp file
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.pt') as tmp:
-                for chunk in resp.iter_content(chunk_size=8192):
-                    tmp.write(chunk)
-                tmp_path = tmp.name
-        
-        # Load from temp file
+        )
         shard_data = torch.load(tmp_path, map_location='cpu', weights_only=True)
-        os.remove(tmp_path)
-        
+        with contextlib.suppress(FileNotFoundError):
+            tmp_path.unlink()
         return shard_data
-        
     except Exception as e:
         print(f"❌ Shard {shard_id} download failed: {e}")
         return None
@@ -2645,9 +2834,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reward-address",
         default=None,
-        help="Separate address for receiving ALICE rewards (optional). "
-             "If not set, rewards go to --address. "
-             "Use this on cloud GPUs to keep main wallet safe."
+        help="Optional payout address separate from --address. "
+             "See README: Separate Reward Address (Cloud GPU Safe Pattern)."
     )
     parser.add_argument(
         "--precision",
@@ -2723,7 +2911,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
     profile_path = device_profile_path()
     heartbeat_stop: Optional[threading.Event] = None
     heartbeat_re_register: Optional[threading.Event] = None
-    runtime_auth_state: Optional[Dict[str, Any]] = None
+    runtime_session: Optional[RuntimeSession] = None
 
     # Never exit on transient errors; only Ctrl+C stops the miner.
     while True:
@@ -2772,25 +2960,26 @@ def run_plan_a(args: argparse.Namespace) -> None:
                 retry_seconds=30,
             )
             miner_instance_id = str(register_response.get("instance_id") or register_response.get("miner_id") or miner_instance_id or wallet_address)
-            auth_token = str(register_response.get("token", "")).strip()
-            if not auth_token:
+            register_token = str(register_response.get("token", "")).strip()
+            if not register_token:
                 print("❌ Runtime registration succeeded but no auth token returned; retrying in 30s...")
                 time.sleep(30)
                 continue
-            if runtime_auth_state is None:
-                runtime_auth_state = _new_runtime_auth_state(
+            if runtime_session is None:
+                runtime_session = _new_runtime_auth_state(
                     data_plane_url,
                     miner_instance_id,
                     capabilities,
-                    auth_token,
+                    register_token,
                 )
             else:
                 _update_runtime_auth_state(
-                    runtime_auth_state,
+                    runtime_session,
                     data_plane_url=data_plane_url,
                     miner_id=miner_instance_id,
                     capabilities=capabilities,
-                    auth_token=auth_token,
+                    auth_token=register_token,
+                    instance_id=miner_instance_id,
                 )
 
             # Use first assigned task to learn layer assignment + model version.
@@ -2808,7 +2997,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     data_plane_url,
                     miner_instance_id,
                     capabilities,
-                    auth_token=auth_token,
+                    auth_token=runtime_session.token,
                     retry_delay=15,
                     max_attempts=5,
                 )
@@ -2839,7 +3028,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     ):
                         _emit_miner_epoch_report(Path(args.report_dir), control_plane_url, current_epoch_stats)
                         current_epoch_stats = None
-                    heartbeat_status = send_runtime_heartbeat(runtime_auth_state)
+                    heartbeat_status = send_runtime_heartbeat(runtime_session)
                     if heartbeat_status == "re_register":
                         print("⚠️ Runtime auth rejected during idle heartbeat, re-registering...")
                         if heartbeat_stop is not None:
@@ -2909,7 +3098,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     print(f"✅ Using cached model: {model_path}")
 
             heartbeat_stop, heartbeat_re_register, _heartbeat_thread = start_heartbeat_loop(
-                runtime_auth_state,
+                runtime_session,
             )
 
             # Load state_dict to detect assigned_layers if not set
@@ -3172,12 +3361,12 @@ def run_plan_a(args: argparse.Namespace) -> None:
                         data_plane_url,
                         miner_instance_id,
                         capabilities,
-                        auth_token=auth_token,
+                        auth_token=runtime_session.token,
                         retry_delay=15,
                         max_attempts=5,
                     )
                     if status == "no_task":
-                        heartbeat_status = send_runtime_heartbeat(runtime_auth_state)
+                        heartbeat_status = send_runtime_heartbeat(runtime_session)
                         if heartbeat_status == "re_register":
                             print("⚠️ Runtime auth rejected during idle heartbeat, re-registering...")
                             if heartbeat_stop is not None:
@@ -3242,7 +3431,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                 shard_data = download_shard_streaming(
                     data_plane_url,
                     shard_id,
-                    auth_token=auth_token,
+                    auth_token=runtime_session.token,
                 )
                 if shard_data is None:
                     print("❌ Shard download failed, skipping task")
@@ -3271,7 +3460,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     miner_instance_id,
                     int(shard_id),
                     task_epoch,
-                    auth_token=auth_token,
+                    auth_token=runtime_session.token,
                 )
 
                 train_time = time.time() - start_time
@@ -3355,6 +3544,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     batch_size=trained_batch_size,
                     training_time_s=train_time,
                 )
+                runtime_session.update(capabilities=capabilities)
                 if measured_tflops is not None:
                     measured_tflops_ema = capabilities.get("measured_tflops_ema")
                     print(
@@ -3420,7 +3610,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     task_nonce,
                     compressed,
                     metrics,
-                    auth_token=auth_token,
+                    auth_token=runtime_session.token,
                 )
                 if submit_status == "accepted":
                     gradients_accepted += 1

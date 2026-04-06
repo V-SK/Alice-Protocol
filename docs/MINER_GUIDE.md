@@ -89,9 +89,10 @@ Optional:
 ```bash
 python3 miner/alice_miner.py \
   --ps-url https://ps.aliceprotocol.org \
-  --address aControlAddress \
-  --reward-address aRewardAddress
+  --address aControlAddress
 ```
+
+For the cloud-safe payout pattern, see [README: Separate Reward Address (Cloud GPU Safe Pattern)](../README.md#separate-reward-address-cloud-gpu-safe-pattern).
 
 ## 4. Multi-GPU mining
 
@@ -230,9 +231,7 @@ Those are local runtime throttles, not the source of truth for physical VRAM.
 
 ## 8. Rewards
 
-Rewards are paid to:
-- `--reward-address` if provided
-- otherwise `--address`
+Rewards follow the canonical README guidance in [Separate Reward Address (Cloud GPU Safe Pattern)](../README.md#separate-reward-address-cloud-gpu-safe-pattern).
 
 Reward timing depends on successful epoch settlement on chain.
 

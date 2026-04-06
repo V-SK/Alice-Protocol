@@ -116,7 +116,7 @@ class LocalTrainer:
         ps_url: str,
         aggregator_url: str,
         miner_address: str,
-        token: str,
+        auth: miner_lib.AtomicTokenHolder,
         args: Any,
         miner_instance_id: Optional[str] = None,
     ) -> None:
@@ -126,7 +126,7 @@ class LocalTrainer:
         self.aggregator_url = _normalize_url(aggregator_url)
         self.miner_address = str(miner_address)
         self.miner_instance_id = str(miner_instance_id or miner_address)
-        self.token = str(token or "")
+        self.auth = auth
         self.args = args
         self.snapshot_dir = SNAPSHOT_DIR
         self.delta_outbox_dir = DELTA_OUTBOX_DIR
@@ -229,7 +229,10 @@ class LocalTrainer:
             spool_dir.rmdir()
 
     def _headers(self) -> Dict[str, str]:
-        return miner_lib._auth_headers(self.token)
+        return self.auth.headers
+
+    def _runtime_data_plane_url(self) -> str:
+        return _normalize_url(self.auth.data_plane_url or self.aggregator_url)
 
     def _target_batch_size(self) -> int:
         ps_cap = max(1, int(self.assigned_batch_size or 0) or 2)
@@ -510,15 +513,12 @@ class LocalTrainer:
         layer_files = metadata.get("layer_files") or []
         for filepath in layer_files:
             layer_name = Path(filepath).stem
-            headers = {
-                "X-Layer-Name": layer_name,
-                "X-Miner-Id": self.miner_address,
-            }
-            headers.update(self._headers())
+            headers = dict(self._headers())
+            headers["X-Layer-Name"] = layer_name
             try:
                 with open(filepath, "rb") as handle:
                     resp = requests.post(
-                        f"{self.aggregator_url}/delta/upload_layer",
+                        f"{self._runtime_data_plane_url()}/delta/upload_layer",
                         data=handle.read(),
                         headers=headers,
                         timeout=120,
@@ -536,7 +536,7 @@ class LocalTrainer:
                 return False
 
         finalize_payload = {
-            "miner_id": self.miner_address,
+            "miner_id": str(self.auth.miner_id or self.miner_address),
             "completed_shards": int(metadata.get("completed_shards", 0) or 0),
             "batch_size": int(metadata.get("batch_size", 0) or 0),
             "completed_effective_tokens": int(metadata.get("completed_effective_tokens", 0) or 0),
@@ -545,7 +545,7 @@ class LocalTrainer:
         }
         try:
             resp = requests.post(
-                f"{self.aggregator_url}/delta/finalize",
+                f"{self._runtime_data_plane_url()}/delta/finalize",
                 json=finalize_payload,
                 headers=self._headers(),
                 timeout=30,
@@ -676,7 +676,7 @@ class LocalTrainer:
         }
 
     def _download_full_model_direct(self, version: int, model_path: Path) -> None:
-        ok = miner_lib.download_model_streaming(self.ps_url, model_path, auth_token=self.token)
+        ok = miner_lib.download_model_streaming(self.ps_url, model_path, auth_token=self.auth.token)
         if not ok:
             raise RuntimeError(f"[PLAN-B] Full model download failed for version {version}")
 
@@ -749,7 +749,12 @@ class LocalTrainer:
         try:
             url = f"{self.ps_url.rstrip('/')}/model/epoch_update?from_version={int(from_version)}"
             try:
-                total_bytes = miner_lib._stream_download_with_resume(url, tmp_path, timeout_s=600)
+                total_bytes = miner_lib._stream_download_with_resume(
+                    url,
+                    tmp_path,
+                    timeout_s=600,
+                    headers=self._headers(),
+                )
             except requests.HTTPError as exc:
                 response = exc.response
                 if response is not None and response.status_code in (404, 501):
@@ -998,8 +1003,7 @@ class LocalTrainer:
 
 def notify_shard_complete(
     aggregator_url: str,
-    miner_id: str,
-    token: str,
+    auth: miner_lib.AtomicTokenHolder,
     task: Dict[str, Any],
     avg_loss: float,
 ) -> bool:
@@ -1012,7 +1016,7 @@ def notify_shard_complete(
         resp = requests.post(
             f"{_normalize_url(aggregator_url)}/shard/complete",
             json=payload,
-            headers=miner_lib._auth_headers(token),
+            headers=auth.headers,
             timeout=15,
         )
         if resp.status_code in (404, 501):
@@ -1027,13 +1031,12 @@ def notify_shard_complete(
 
 def confirm_shard_complete(
     ps_url: str,
-    miner_id: str,
-    token: str,
+    auth: miner_lib.AtomicTokenHolder,
     shard_id: int,
     epoch: Optional[int] = None,
 ) -> None:
     payload: Dict[str, Any] = {
-        "miner_id": str(miner_id),
+        "miner_id": str(auth.miner_id or ""),
         "shard_id": int(shard_id),
     }
     if epoch is not None:
@@ -1042,11 +1045,19 @@ def confirm_shard_complete(
         requests.post(
             f"{_normalize_url(ps_url)}/shard/confirm",
             json=payload,
-            headers=miner_lib._auth_headers(token),
+            headers=auth.headers,
             timeout=5,
         )
     except Exception:
         pass
+
+
+def _flush_pending_delta(trainer: LocalTrainer, reason: str) -> bool:
+    pending_delta = trainer.recover_pending_delta()
+    if pending_delta is None:
+        return True
+    _plan_b_log(f"{reason}: {pending_delta.get('spool_dir')}")
+    return trainer.submit_delta(pending_delta)
 
 
 def wait_for_next_epoch(trainer: LocalTrainer, poll_interval_s: int = 15) -> None:
@@ -1110,6 +1121,7 @@ def run_plan_b(args: Any) -> None:
     lock_fp = miner_lib.acquire_single_instance_lock(miner_instance_id)
     heartbeat_stop: Optional[Any] = None
     heartbeat_re_register: Optional[Any] = None
+    runtime_session: Optional[miner_lib.RuntimeSession] = None
     trainer: Optional[LocalTrainer] = None
     _ = lock_fp
 
@@ -1126,15 +1138,25 @@ def run_plan_b(args: Any) -> None:
                 retry_seconds=30,
             )
             miner_instance_id = str(register_response.get("instance_id") or register_response.get("miner_id") or wallet_address)
-            auth_token = str(register_response.get("token", "")).strip()
-            if not auth_token:
+            register_token = str(register_response.get("token", "")).strip()
+            if not register_token:
                 raise RuntimeError("[PLAN-B] Registration returned empty auth token")
-            runtime_auth_state = miner_lib._build_runtime_auth_state(
-                data_plane_url,
-                miner_instance_id,
-                capabilities,
-                auth_token,
-            )
+            if runtime_session is None:
+                runtime_session = miner_lib._build_runtime_auth_state(
+                    data_plane_url,
+                    miner_instance_id,
+                    capabilities,
+                    register_token,
+                )
+            else:
+                miner_lib._update_runtime_auth_state(
+                    runtime_session,
+                    data_plane_url=data_plane_url,
+                    miner_id=miner_instance_id,
+                    capabilities=capabilities,
+                    auth_token=register_token,
+                    instance_id=miner_instance_id,
+                )
 
             device = torch.device(capabilities["device_type"])
             trainer = LocalTrainer(
@@ -1143,32 +1165,26 @@ def run_plan_b(args: Any) -> None:
                 ps_url=control_plane_url,
                 aggregator_url=data_plane_url,
                 miner_address=wallet_address,
-                token=auth_token,
+                auth=runtime_session.auth,
                 args=args,
                 miner_instance_id=miner_instance_id,
             )
-            pending_delta = trainer.recover_pending_delta()
-            if pending_delta is not None:
-                _plan_b_log(f"Found pending delta spool at startup: {pending_delta.get('spool_dir')}")
-                if not trainer.submit_delta(pending_delta):
-                    _plan_b_log("Pending delta upload failed at startup; re-registering before training")
-                    time.sleep(10)
-                    continue
+            if not _flush_pending_delta(trainer, "Found pending delta spool at startup"):
+                _plan_b_log("Pending delta upload failed at startup; re-registering before training")
+                time.sleep(10)
+                continue
             trainer.apply_epoch_updates()
             heartbeat_stop, heartbeat_re_register, _thread = miner_lib.start_heartbeat_loop(
-                runtime_auth_state,
+                runtime_session,
             )
 
             while True:
                 if heartbeat_re_register is not None and heartbeat_re_register.is_set():
                     _plan_b_log("Heartbeat requested re-registration")
                     break
-                pending_delta = trainer.recover_pending_delta()
-                if pending_delta is not None:
-                    _plan_b_log(f"Retrying pending delta spool before next epoch: {pending_delta.get('spool_dir')}")
-                    if not trainer.submit_delta(pending_delta):
-                        _plan_b_log("Pending delta upload still failing; re-registering before new epoch")
-                        break
+                if not _flush_pending_delta(trainer, "Retrying pending delta spool before next epoch"):
+                    _plan_b_log("Pending delta upload still failing; re-registering before new epoch")
+                    break
                 trainer.mark_epoch_start()
                 trainer.apply_epoch_updates()
                 trainer.save_global_snapshot()
@@ -1182,10 +1198,10 @@ def run_plan_b(args: Any) -> None:
                         needs_re_registration = True
                         break
                     task, status = miner_lib.request_task_with_retry(
-                        data_plane_url,
-                        miner_instance_id,
+                        runtime_session.data_plane_url,
+                        runtime_session.miner_id,
                         capabilities,
-                        auth_token=auth_token,
+                        auth_token=runtime_session.token,
                         retry_delay=15,
                         max_attempts=5,
                     )
@@ -1200,7 +1216,11 @@ def run_plan_b(args: Any) -> None:
                     trainer.update_task_batch_size(task)
                     shard_id = task.get("shard_id")
                     _plan_b_log(f"Downloading shard {shard_id}")
-                    shard_data = miner_lib.download_shard_streaming(data_plane_url, int(shard_id), auth_token=auth_token)
+                    shard_data = miner_lib.download_shard_streaming(
+                        runtime_session.data_plane_url,
+                        int(shard_id),
+                        auth_token=runtime_session.token,
+                    )
                     if shard_data is None:
                         _plan_b_log(f"Shard download failed for {shard_id}")
                         continue
@@ -1208,11 +1228,10 @@ def run_plan_b(args: Any) -> None:
                     if not completed or avg_loss is None:
                         _plan_b_log(f"Skipping shard {shard_id} after failed local training")
                         continue
-                    notify_shard_complete(data_plane_url, wallet_address, auth_token, task, avg_loss)
+                    notify_shard_complete(runtime_session.data_plane_url, runtime_session.auth, task, avg_loss)
                     confirm_shard_complete(
                         trainer.ps_url,
-                        trainer.miner_address,
-                        trainer.token,
+                        runtime_session.auth,
                         int(shard_id),
                         task.get("epoch"),
                     )
@@ -1251,7 +1270,7 @@ def run_plan_b(args: Any) -> None:
                     _plan_b_log("Delta upload failed, re-registering and retrying once")
                     try:
                         register_response = miner_lib.register_miner_with_retry(
-                            data_plane_url,
+                            runtime_session.data_plane_url,
                             wallet_address,
                             miner_instance_id,
                             capabilities,
@@ -1265,14 +1284,13 @@ def run_plan_b(args: Any) -> None:
                         )
                         new_token = str(register_response.get("token", "")).strip()
                         if new_token:
-                            auth_token = new_token
-                            trainer.token = new_token
                             miner_lib._update_runtime_auth_state(
-                                runtime_auth_state,
-                                data_plane_url=data_plane_url,
+                                runtime_session,
+                                data_plane_url=runtime_session.data_plane_url,
                                 miner_id=miner_instance_id,
                                 capabilities=capabilities,
                                 auth_token=new_token,
+                                instance_id=miner_instance_id,
                             )
                             success = trainer.submit_delta(metadata)
                             if success:

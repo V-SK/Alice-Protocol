@@ -81,12 +81,26 @@ Default Plan B:
 python3 miner/alice_miner.py --address YOUR_ADDRESS
 ```
 
-Separate reward address:
+## Separate Reward Address (Cloud GPU Safe Pattern)
+
+Why:
+
+- Use `--address` as the control/sign-in identity the miner registers with.
+- Use `--reward-address` as the payout destination when the miner runs on rented or shared cloud GPUs.
+- This keeps the reward wallet separate from the operational wallet you expose on the remote host.
+
+How:
+
+- If `--reward-address` is omitted, rewards go to `--address`.
+- If `--reward-address` is set, rewards go to that address while the miner still authenticates as `--address`.
+- The safe pattern is to keep `--address` on the cloud worker and direct rewards to a separate cold or payout wallet.
+
+Example:
 
 ```bash
 python3 miner/alice_miner.py \
-  --address YOUR_ADDRESS \
-  --reward-address YOUR_REWARD_ADDRESS
+  --address YOUR_CONTROL_ADDRESS \
+  --reward-address YOUR_PAYOUT_ADDRESS
 ```
 
 Multi-GPU:
