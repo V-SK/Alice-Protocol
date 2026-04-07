@@ -1163,14 +1163,20 @@ def run_plan_b(args: Any) -> None:
                 capabilities,
                 retry_seconds=30,
             )
-            miner_instance_id = str(register_response.get("instance_id") or register_response.get("miner_id") or wallet_address)
+            runtime_miner_id = str(register_response.get("miner_id") or "").strip()
+            if not runtime_miner_id:
+                raise RuntimeError(
+                    "[PLAN-B] Registration response missing 'miner_id' field. "
+                    "Aggregator must return runtime miner_id. Cannot continue."
+                )
+            miner_instance_id = str(register_response.get("instance_id") or runtime_miner_id)
             register_token = str(register_response.get("token", "")).strip()
             if not register_token:
                 raise RuntimeError("[PLAN-B] Registration returned empty auth token")
             if runtime_session is None:
                 runtime_session = miner_lib._build_runtime_auth_state(
                     data_plane_url,
-                    miner_instance_id,
+                    runtime_miner_id,
                     capabilities,
                     register_token,
                 )
@@ -1178,7 +1184,7 @@ def run_plan_b(args: Any) -> None:
                 miner_lib._update_runtime_auth_state(
                     runtime_session,
                     data_plane_url=data_plane_url,
-                    miner_id=miner_instance_id,
+                    miner_id=runtime_miner_id,
                     capabilities=capabilities,
                     auth_token=register_token,
                     instance_id=miner_instance_id,
@@ -1302,18 +1308,24 @@ def run_plan_b(args: Any) -> None:
                             capabilities,
                             retry_seconds=10,
                         )
+                        if not register_response:
+                            raise RuntimeError("[PLAN-B] Re-registration returned empty response")
+                        runtime_miner_id = str(register_response.get("miner_id") or "").strip()
+                        if not runtime_miner_id:
+                            raise RuntimeError(
+                                "[PLAN-B] Registration response missing 'miner_id' field. "
+                                "Aggregator must return runtime miner_id. Cannot continue."
+                            )
                         miner_instance_id = str(
                             register_response.get("instance_id")
-                            or register_response.get("miner_id")
-                            or miner_instance_id
-                            or wallet_address
+                            or runtime_miner_id
                         )
                         new_token = str(register_response.get("token", "")).strip()
                         if new_token:
                             miner_lib._update_runtime_auth_state(
                                 runtime_session,
                                 data_plane_url=runtime_session.data_plane_url,
-                                miner_id=miner_instance_id,
+                                miner_id=runtime_miner_id,
                                 capabilities=capabilities,
                                 auth_token=new_token,
                                 instance_id=miner_instance_id,
