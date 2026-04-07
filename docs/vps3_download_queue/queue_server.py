@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
+import time
 from typing import Dict, Tuple
 
 from flask import Flask, jsonify, request
@@ -43,6 +45,21 @@ def create_app() -> Flask:
         download_timeout=_env_int("DL_TIMEOUT", 1200),
         slot_estimate_sec=_env_int("DL_SLOT_ESTIMATE", 960),
     )
+    cleanup_interval = max(5, _env_int("DL_CLEANUP_INTERVAL", 60))
+
+    def _periodic_cleanup() -> None:
+        while True:
+            time.sleep(cleanup_interval)
+            try:
+                manager.maintenance_tick()
+            except Exception:
+                log.exception("Periodic queue cleanup failed")
+
+    threading.Thread(
+        target=_periodic_cleanup,
+        name="alice-download-queue-cleanup",
+        daemon=True,
+    ).start()
 
     @app.get("/health")
     def health() -> Tuple[str, int]:
