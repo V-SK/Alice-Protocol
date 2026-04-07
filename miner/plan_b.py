@@ -30,6 +30,7 @@ MAX_INCREMENTAL_CATCHUP_GAP = 5
 BATCH_RESTORE_SUCCESS_SHARDS = 3
 MAX_OOM_RETRIES_AT_BATCH1 = 3
 MODEL_INFO_CACHE_TTL_S = 15
+DELTA_SPOOL_ARCHIVE_DIR = DELTA_OUTBOX_DIR / "archived"
 
 
 def _plan_b_log(message: str) -> None:
@@ -215,7 +216,7 @@ class LocalTrainer:
             manifest = self._read_spool_manifest(manifest_path)
             if manifest is None:
                 continue
-            if str(manifest.get("state") or "pending_upload") == "uploaded":
+            if str(manifest.get("state") or "pending_upload") in {"uploaded", "abandoned"}:
                 continue
             return manifest
         return None
@@ -229,6 +230,21 @@ class LocalTrainer:
                 path.unlink()
         with contextlib.suppress(Exception):
             spool_dir.rmdir()
+
+    def _archive_spool(self, metadata: Dict[str, Any], reason: str) -> None:
+        spool_dir = Path(str(metadata.get("spool_dir") or ""))
+        if not spool_dir.exists():
+            return
+        DELTA_SPOOL_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        archive_dir = DELTA_SPOOL_ARCHIVE_DIR / f"{spool_dir.name}_{timestamp}"
+        manifest = dict(metadata)
+        manifest["state"] = "abandoned"
+        manifest["archive_reason"] = reason
+        manifest["archived_at"] = time.time()
+        self._write_spool_manifest(manifest)
+        os.replace(spool_dir, archive_dir)
+        _plan_b_log(f"Archived stale pending delta spool: {archive_dir} reason={reason}")
 
     def _headers(self) -> Dict[str, str]:
         return self.auth.headers
@@ -503,11 +519,12 @@ class LocalTrainer:
                         headers=headers,
                         timeout=120,
                     )
-                if resp.status_code in (404, 501):
-                    _plan_b_log(f"Delta upload endpoint unavailable ({resp.status_code}); deferring until Day 2")
-                    manifest["state"] = "pending_upload"
-                    self._write_spool_manifest(manifest)
-                    return False
+                if resp.status_code in (401, 403, 404, 410, 501):
+                    self._archive_spool(
+                        metadata,
+                        f"upload_layer_http_{resp.status_code}_{layer_name}",
+                    )
+                    return True
                 resp.raise_for_status()
             except Exception as exc:
                 _plan_b_log(f"Delta upload failed for {layer_name}: {exc}")
@@ -530,11 +547,12 @@ class LocalTrainer:
                 headers=self._headers(),
                 timeout=30,
             )
-            if resp.status_code in (404, 501):
-                _plan_b_log(f"Delta finalize endpoint unavailable ({resp.status_code}); deferring until Day 2")
-                manifest["state"] = "pending_upload"
-                self._write_spool_manifest(manifest)
-                return False
+            if resp.status_code in (401, 403, 404, 410, 501):
+                self._archive_spool(
+                    metadata,
+                    f"delta_finalize_http_{resp.status_code}",
+                )
+                return True
             resp.raise_for_status()
         except Exception as exc:
             _plan_b_log(f"Delta finalize failed: {exc}")
