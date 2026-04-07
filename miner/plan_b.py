@@ -107,6 +107,15 @@ def _load_update_payload(raw_bytes: bytes) -> Dict[str, Any]:
     return torch.load(io.BytesIO(raw_bytes), map_location="cpu", weights_only=True)
 
 
+def _chunk_indices_for_apply(chunk: Dict[str, Any]) -> torch.Tensor:
+    indices = chunk.get("indices")
+    if not torch.is_tensor(indices):
+        raise TypeError("sparse update chunk missing tensor indices")
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise TypeError(f"unsupported sparse update index dtype: {indices.dtype}")
+    return indices.to(dtype=torch.long, device="cpu")
+
+
 def _version_marker_path() -> Path:
     return PLAN_B_MODEL_DIR / "current_version"
 
@@ -788,7 +797,7 @@ class LocalTrainer:
                     param = named_params.get(name)
                     if param is None:
                         continue
-                    indices = chunk["indices"].long()
+                    indices = _chunk_indices_for_apply(chunk)
                     values = chunk["values"].float()
                     param_flat = param.data.view(-1)
                     param_flat[indices.to(param.device)] += values.to(param.device)

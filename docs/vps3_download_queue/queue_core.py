@@ -154,6 +154,11 @@ class DownloadQueueManager:
             )
         self._promote_unlocked()
 
+    def maintenance_tick(self) -> None:
+        """Expire stale download slots and promote queued miners."""
+        with self._lock:
+            self._cleanup_unlocked()
+
     def join(self, address: str, instance_id: str, client_ip: str) -> Dict[str, object]:
         wallet = str(address or client_ip).strip() or client_ip
         miner_instance = str(instance_id or wallet).strip() or wallet
