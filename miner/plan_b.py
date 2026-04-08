@@ -665,6 +665,21 @@ class LocalTrainer:
             status.get("version"),
             status.get("current_version"),
         ) or 0
+        # DEFENSE: never voluntarily downgrade.
+        # If PS reports inconsistent version fields, take the max
+        # across all signals plus current local state. Protects
+        # against PS-side stale state causing miners to bootstrap
+        # on older models.
+        # Incident: 2026-04-08 cutover left PS live_version stale.
+        _floor_candidates = [
+            target_version,
+            int(_coerce_version(info.get("version")) or 0),
+            int(_coerce_version(info.get("model_version")) or 0),
+            int(_coerce_version(info.get("published_full_version")) or 0),
+            int(_coerce_version(status.get("model_version")) or 0),
+            int(self.current_model_version or 0),
+        ]
+        target_version = max(_floor_candidates)
         published_full_version = _pick_first_version(
             info.get("published_full_version"),
             info.get("version"),
@@ -1026,9 +1041,24 @@ class LocalTrainer:
             from_version = int(self.current_model_version)
             next_version = from_version + 1
             if published_update_version < next_version:
-                if published_update_version < target_version:
+                # Delta chain is broken: PS published a newer full
+                # model but the delta update for next_version does
+                # not exist. This happens after cutover-class
+                # operations. Fall back to full-model download
+                # instead of waiting forever for an update that
+                # will never be published.
+                # Incident: 2026-04-08 cutover did not generate update_v186.pt.
+                _plan_b_log(
+                    f"Delta chain gap: current=v{from_version}, "
+                    f"target=v{target_version}, "
+                    f"published_update_version=v{published_update_version}. "
+                    f"Falling back to full-model download for v{target_version}."
+                )
+                try:
+                    self.download_full_model(version=target_version)
+                except Exception as exc:
                     _plan_b_log(
-                        f"Published epoch updates currently stop at v{published_update_version}; waiting to catch up to live v{target_version}"
+                        f"Full-model fallback failed: {exc}; will retry next epoch"
                     )
                 return
 
