@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plan B miner runtime with epoch-level local SGD and sparse delta upload."""
+"""Plan B miner runtime with epoch-level local SGD and sparse param-diff upload."""
 
 import contextlib
 import gc
@@ -21,8 +21,10 @@ miner_lib.configure_timestamp_logging()
 
 
 SNAPSHOT_DIR = Path.home() / ".alice" / "global_snapshot"
-DELTA_OUTBOX_DIR = Path.home() / ".alice" / "delta_outbox"
+PARAM_DIFF_OUTBOX_DIR = Path.home() / ".alice" / "param_diff_outbox"
 PLAN_B_MODEL_DIR = Path.home() / ".alice" / "plan_b_models"
+PLAN_B_DELTA_SEMANTICS = "param_diff"
+PLAN_B_PROTOCOL_VERSION = "2"
 STATUS_CACHE_TTL_S = 30
 TRAINING_WINDOW_S = 3000
 SUBMIT_WINDOW_S = 600
@@ -30,7 +32,7 @@ MAX_INCREMENTAL_CATCHUP_GAP = 5
 BATCH_RESTORE_SUCCESS_SHARDS = 3
 MAX_OOM_RETRIES_AT_BATCH1 = 3
 MODEL_INFO_CACHE_TTL_S = 15
-DELTA_SPOOL_ARCHIVE_DIR = DELTA_OUTBOX_DIR / "archived"
+PARAM_DIFF_SPOOL_ARCHIVE_DIR = PARAM_DIFF_OUTBOX_DIR / "archived"
 
 
 def _plan_b_log(message: str) -> None:
@@ -141,9 +143,9 @@ class LocalTrainer:
         self.auth = auth
         self.args = args
         self.snapshot_dir = SNAPSHOT_DIR
-        self.delta_outbox_dir = DELTA_OUTBOX_DIR
+        self.param_diff_outbox_dir = PARAM_DIFF_OUTBOX_DIR
         self.snapshot_dir.mkdir(parents=True, exist_ok=True)
-        self.delta_outbox_dir.mkdir(parents=True, exist_ok=True)
+        self.param_diff_outbox_dir.mkdir(parents=True, exist_ok=True)
         PLAN_B_MODEL_DIR.mkdir(parents=True, exist_ok=True)
         self.current_model_version: Optional[int] = None
         self.assigned_batch_size: Optional[int] = None
@@ -175,7 +177,7 @@ class LocalTrainer:
 
     def _spool_dir(self, model_version: Optional[int] = None) -> Path:
         version = int(model_version if model_version is not None else self.current_model_version or 0)
-        return self.delta_outbox_dir / f"v{version}"
+        return self.param_diff_outbox_dir / f"v{version}"
 
     def _spool_manifest_path(self, spool_dir: Optional[Path] = None) -> Path:
         return (spool_dir or self._spool_dir()) / "manifest.json"
@@ -215,9 +217,9 @@ class LocalTrainer:
         data["layer_files"] = materialized_files
         return data
 
-    def recover_pending_delta(self) -> Optional[Dict[str, Any]]:
+    def recover_pending_param_diff(self) -> Optional[Dict[str, Any]]:
         manifests = sorted(
-            self.delta_outbox_dir.glob("v*/manifest.json"),
+            self.param_diff_outbox_dir.glob("v*/manifest.json"),
             key=lambda path: path.stat().st_mtime,
             reverse=True,
         )
@@ -244,19 +246,25 @@ class LocalTrainer:
         spool_dir = Path(str(metadata.get("spool_dir") or ""))
         if not spool_dir.exists():
             return
-        DELTA_SPOOL_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
+        PARAM_DIFF_SPOOL_ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
         timestamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-        archive_dir = DELTA_SPOOL_ARCHIVE_DIR / f"{spool_dir.name}_{timestamp}"
+        archive_dir = PARAM_DIFF_SPOOL_ARCHIVE_DIR / f"{spool_dir.name}_{timestamp}"
         manifest = dict(metadata)
         manifest["state"] = "abandoned"
         manifest["archive_reason"] = reason
         manifest["archived_at"] = time.time()
         self._write_spool_manifest(manifest)
         os.replace(spool_dir, archive_dir)
-        _plan_b_log(f"Archived stale pending delta spool: {archive_dir} reason={reason}")
+        _plan_b_log(f"Archived stale pending param_diff spool: {archive_dir} reason={reason}")
 
     def _headers(self) -> Dict[str, str]:
         return self.auth.headers
+
+    def _plan_b_headers(self) -> Dict[str, str]:
+        headers = dict(self._headers())
+        headers["X-Delta-Semantics"] = PLAN_B_DELTA_SEMANTICS
+        headers["X-Plan-B-Protocol-Version"] = PLAN_B_PROTOCOL_VERSION
+        return headers
 
     def _runtime_data_plane_url(self) -> str:
         return _normalize_url(self.auth.data_plane_url or self.aggregator_url)
@@ -432,15 +440,15 @@ class LocalTrainer:
             )
             return avg_loss, current_batch_size, True
 
-    def compute_and_compress_delta(self) -> Dict[str, Any]:
+    def compute_and_compress_param_diff(self) -> Dict[str, Any]:
         if self.model is None:
             raise RuntimeError("Plan B model is not initialized")
         if self.current_model_version is None:
             raise RuntimeError("Plan B current model version is unknown")
-        existing = self.recover_pending_delta()
+        existing = self.recover_pending_param_diff()
         if existing is not None and int(existing.get("model_version", -1) or -1) == int(self.current_model_version):
             _plan_b_log(
-                f"Reusing pending delta spool for model v{self.current_model_version}: "
+                f"Reusing pending param_diff spool for model v{self.current_model_version}: "
                 f"{existing.get('spool_dir')}"
             )
             return existing
@@ -448,9 +456,16 @@ class LocalTrainer:
         total_entries = 0
         total_bytes = 0
         total_norm_sq = 0.0
-        delta_norm_per_layer: Dict[str, float] = {}
+        param_diff_norm_per_layer: Dict[str, float] = {}
         layer_files: List[str] = []
-        ratio = float(getattr(self.args, "delta_compression_ratio", 0.005) or 0.005)
+        ratio = float(
+            getattr(
+                self.args,
+                "param_diff_compression_ratio",
+                getattr(self.args, "delta_compression_ratio", 0.005),
+            )
+            or 0.005
+        )
         spool_dir = self._spool_dir(self.current_model_version)
         if spool_dir.exists():
             for path in spool_dir.glob("*"):
@@ -461,15 +476,15 @@ class LocalTrainer:
 
         for name, param in self.model.named_parameters():
             global_param = self.load_global_param(name)
-            delta = param.detach().cpu().float() - global_param.float()
-            flat = delta.flatten()
+            param_diff = param.detach().cpu().float() - global_param.float()
+            flat = param_diff.flatten()
             if flat.numel() == 0:
                 continue
             k = max(1, int(flat.numel() * ratio))
             _, topk_idx = torch.topk(flat.abs(), k)
             topk_vals = flat[topk_idx].float()
-            layer_norm = float(delta.norm().item())
-            delta_norm_per_layer[name] = layer_norm
+            layer_norm = float(param_diff.norm().item())
+            param_diff_norm_per_layer[name] = layer_norm
             total_norm_sq += layer_norm ** 2
 
             payload = {
@@ -484,7 +499,7 @@ class LocalTrainer:
             total_bytes += output_path.stat().st_size
             layer_files.append(output_path.name)
 
-        delta_norm = total_norm_sq ** 0.5
+        param_diff_norm = total_norm_sq ** 0.5
         metadata = {
             "state": "pending_upload",
             "created_at": time.time(),
@@ -494,8 +509,8 @@ class LocalTrainer:
             "model_version": int(self.current_model_version),
             "total_entries": total_entries,
             "total_bytes": total_bytes,
-            "delta_norm": delta_norm,
-            "delta_norm_per_layer": delta_norm_per_layer,
+            "param_diff_norm": param_diff_norm,
+            "param_diff_norm_per_layer": param_diff_norm_per_layer,
             "layer_files": layer_files,
             "completed_shards": 0,
             "completed_effective_tokens": 0,
@@ -504,21 +519,21 @@ class LocalTrainer:
         self._write_spool_manifest(metadata)
         materialized = self._read_spool_manifest(manifest_path)
         if materialized is None:
-            raise RuntimeError("Failed to materialize delta spool manifest")
+            raise RuntimeError("Failed to materialize param_diff spool manifest")
         _plan_b_log(
-            f"Compressed delta: layers={len(layer_files)}, entries={total_entries}, bytes={total_bytes}, "
-            f"norm={delta_norm:.4f}, spool={spool_dir}"
+            f"Compressed param_diff: layers={len(layer_files)}, entries={total_entries}, bytes={total_bytes}, "
+            f"norm={param_diff_norm:.4f}, spool={spool_dir}"
         )
         return materialized
 
-    def submit_delta(self, metadata: Dict[str, Any]) -> bool:
+    def submit_param_diff(self, metadata: Dict[str, Any]) -> bool:
         manifest = dict(metadata)
         manifest["state"] = "uploading"
         self._write_spool_manifest(manifest)
         layer_files = metadata.get("layer_files") or []
         for filepath in layer_files:
             layer_name = Path(filepath).stem
-            headers = dict(self._headers())
+            headers = self._plan_b_headers()
             headers["X-Layer-Name"] = layer_name
             try:
                 with open(filepath, "rb") as handle:
@@ -536,7 +551,7 @@ class LocalTrainer:
                     return True
                 resp.raise_for_status()
             except Exception as exc:
-                _plan_b_log(f"Delta upload failed for {layer_name}: {exc}")
+                _plan_b_log(f"Param diff upload failed for {layer_name}: {exc}")
                 manifest["state"] = "pending_upload"
                 self._write_spool_manifest(manifest)
                 return False
@@ -546,25 +561,25 @@ class LocalTrainer:
             "completed_shards": int(metadata.get("completed_shards", 0) or 0),
             "batch_size": int(metadata.get("batch_size", 0) or 0),
             "completed_effective_tokens": int(metadata.get("completed_effective_tokens", 0) or 0),
-            "delta_norm": float(metadata.get("delta_norm", 0.0) or 0.0),
+            "param_diff_norm": float(metadata.get("param_diff_norm", 0.0) or 0.0),
             "model_version": int(metadata.get("model_version", self.current_model_version or 0) or 0),
         }
         try:
             resp = requests.post(
                 f"{self._runtime_data_plane_url()}/delta/finalize",
                 json=finalize_payload,
-                headers=self._headers(),
+                headers=self._plan_b_headers(),
                 timeout=30,
             )
             if resp.status_code in (401, 403, 404, 410, 501):
                 self._archive_spool(
                     metadata,
-                    f"delta_finalize_http_{resp.status_code}",
+                    f"param_diff_finalize_http_{resp.status_code}",
                 )
                 return True
             resp.raise_for_status()
         except Exception as exc:
-            _plan_b_log(f"Delta finalize failed: {exc}")
+            _plan_b_log(f"Param diff finalize failed: {exc}")
             manifest["state"] = "pending_upload"
             self._write_spool_manifest(manifest)
             return False
@@ -572,7 +587,7 @@ class LocalTrainer:
         manifest["state"] = "uploaded"
         self._write_spool_manifest(manifest)
         self._cleanup_spool(manifest)
-        _plan_b_log("Delta upload complete")
+        _plan_b_log("Param diff upload complete")
         return True
 
     def _fetch_status(self, force: bool = False) -> Dict[str, Any]:
@@ -586,7 +601,7 @@ class LocalTrainer:
         ]
         for url in candidates:
             try:
-                resp = requests.get(url, headers=self._headers(), timeout=10)
+                resp = requests.get(url, headers=self._plan_b_headers(), timeout=10)
                 if resp.status_code != 200:
                     continue
                 data = resp.json()
@@ -607,7 +622,7 @@ class LocalTrainer:
         try:
             resp = requests.get(
                 f"{self.ps_url}/model/info",
-                headers=self._headers(),
+                headers=self._plan_b_headers(),
                 timeout=15,
             )
             if resp.status_code == 200:
@@ -760,7 +775,7 @@ class LocalTrainer:
                     url,
                     tmp_path,
                     timeout_s=600,
-                    headers=self._headers(),
+                    headers=self._plan_b_headers(),
                 )
             except requests.HTTPError as exc:
                 response = exc.response
@@ -1105,12 +1120,12 @@ def confirm_shard_complete(
         pass
 
 
-def _flush_pending_delta(trainer: LocalTrainer, reason: str) -> bool:
-    pending_delta = trainer.recover_pending_delta()
-    if pending_delta is None:
+def _flush_pending_param_diff(trainer: LocalTrainer, reason: str) -> bool:
+    pending_param_diff = trainer.recover_pending_param_diff()
+    if pending_param_diff is None:
         return True
-    _plan_b_log(f"{reason}: {pending_delta.get('spool_dir')}")
-    return trainer.submit_delta(pending_delta)
+    _plan_b_log(f"{reason}: {pending_param_diff.get('spool_dir')}")
+    return trainer.submit_param_diff(pending_param_diff)
 
 
 def wait_for_next_epoch(trainer: LocalTrainer, poll_interval_s: int = 15) -> None:
@@ -1228,8 +1243,8 @@ def run_plan_b(args: Any) -> None:
                 args=args,
                 miner_instance_id=miner_instance_id,
             )
-            if not _flush_pending_delta(trainer, "Found pending delta spool at startup"):
-                _plan_b_log("Pending delta upload failed at startup; re-registering before training")
+            if not _flush_pending_param_diff(trainer, "Found pending param_diff spool at startup"):
+                _plan_b_log("Pending param_diff upload failed at startup; re-registering before training")
                 time.sleep(10)
                 continue
             trainer.apply_epoch_updates()
@@ -1241,8 +1256,8 @@ def run_plan_b(args: Any) -> None:
                 if heartbeat_re_register is not None and heartbeat_re_register.is_set():
                     _plan_b_log("Heartbeat requested re-registration")
                     break
-                if not _flush_pending_delta(trainer, "Retrying pending delta spool before next epoch"):
-                    _plan_b_log("Pending delta upload still failing; re-registering before new epoch")
+                if not _flush_pending_param_diff(trainer, "Retrying pending param_diff spool before next epoch"):
+                    _plan_b_log("Pending param_diff upload still failing; re-registering before new epoch")
                     break
                 trainer.mark_epoch_start()
                 trainer.apply_epoch_updates()
@@ -1301,15 +1316,15 @@ def run_plan_b(args: Any) -> None:
                     needs_re_registration = True
                 if needs_re_registration:
                     if completed_shards == 0:
-                        _plan_b_log("Zero shards trained before re-registration, skipping delta submission")
+                        _plan_b_log("Zero shards trained before re-registration, skipping param_diff submission")
                     break
 
                 if completed_shards == 0:
-                    _plan_b_log("Zero shards trained this epoch, skipping delta submission")
+                    _plan_b_log("Zero shards trained this epoch, skipping param_diff submission")
                     wait_for_next_epoch(trainer)
                     continue
 
-                metadata = trainer.compute_and_compress_delta()
+                metadata = trainer.compute_and_compress_param_diff()
                 metadata["completed_shards"] = completed_shards
                 metadata["batch_size"] = int(
                     (completed_effective_tokens // completed_shards)
@@ -1324,9 +1339,9 @@ def run_plan_b(args: Any) -> None:
                         f"reporting average batch_size={metadata['batch_size']}"
                     )
                 trainer._write_spool_manifest(dict(metadata))
-                success = trainer.submit_delta(metadata)
+                success = trainer.submit_param_diff(metadata)
                 if not success:
-                    _plan_b_log("Delta upload failed, re-registering and retrying once")
+                    _plan_b_log("Param diff upload failed, re-registering and retrying once")
                     try:
                         register_response = miner_lib.register_miner_with_retry(
                             runtime_session.data_plane_url,
@@ -1357,15 +1372,15 @@ def run_plan_b(args: Any) -> None:
                                 auth_token=new_token,
                                 instance_id=miner_instance_id,
                             )
-                            success = trainer.submit_delta(metadata)
+                            success = trainer.submit_param_diff(metadata)
                             if success:
-                                _plan_b_log("Delta upload succeeded after re-register")
+                                _plan_b_log("Param diff upload succeeded after re-register")
                             else:
-                                _plan_b_log("Delta upload still failed after re-register, skipping this epoch")
+                                _plan_b_log("Param diff upload still failed after re-register, skipping this epoch")
                         else:
-                            _plan_b_log("Re-register returned empty token; skipping delta retry")
+                            _plan_b_log("Re-register returned empty token; skipping param_diff retry")
                     except Exception as exc:
-                        _plan_b_log(f"Re-register for delta retry failed: {exc}")
+                        _plan_b_log(f"Re-register for param_diff retry failed: {exc}")
                 wait_for_next_epoch(trainer)
         except KeyboardInterrupt:
             if heartbeat_stop is not None:
