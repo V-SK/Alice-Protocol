@@ -129,6 +129,7 @@ class AtomicTokenHolderTests(unittest.TestCase):
             {"device_type": "cpu"},
             "token-old",
             instance_id="instance-old",
+            control_plane_url="https://control.example",
         )
         trainer = plan_b.LocalTrainer(
             model=None,
@@ -137,6 +138,7 @@ class AtomicTokenHolderTests(unittest.TestCase):
             aggregator_url="https://runtime.example",
             miner_address="wallet-address",
             auth=session.auth,
+            capabilities={"device_type": "cpu"},
             args=mock.Mock(batch_size=0, precision="fp32"),
             miner_instance_id="instance-old",
         )
@@ -156,8 +158,9 @@ class AtomicTokenHolderTests(unittest.TestCase):
         self.assertEqual(trainer.auth.token, "token-new")
         self.assertEqual(trainer._headers()["Authorization"], "Bearer token-new")
         self.assertEqual(trainer._runtime_data_plane_url(), "https://runtime-new.example")
+        self.assertEqual(session.control_plane_url, "https://control.example")
         send_heartbeat.assert_called_once_with(
-            "https://runtime-new.example",
+            "https://control.example",
             "miner-new",
             {"device_type": "cpu"},
             auth_token="token-new",
