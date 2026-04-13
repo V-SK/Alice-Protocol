@@ -85,6 +85,8 @@ SCORE_TIMEOUT = 120  # max seconds per scoring operation
 SAFE_MAX_SEQ_LEN = int(os.environ.get("ALICE_SAFE_MAX_SEQ_LEN", "2048"))
 VALIDATION_SEQ_LEN = int(os.environ.get("ALICE_VALIDATION_SEQ_LEN", "128"))
 VALIDATION_BATCHES_PER_SHARD = int(os.environ.get("ALICE_VALIDATION_BATCHES_PER_SHARD", "1"))
+SCORER_REGISTER_INTERVAL_S = max(15, int(os.environ.get("ALICE_SCORER_REGISTER_INTERVAL_S", "60")))
+SCORER_REGISTER_BOOT_POLL_S = max(2, int(os.environ.get("ALICE_SCORER_REGISTER_BOOT_POLL_S", "5")))
 DEFAULT_REPORT_DIR = Path.home() / ".alice" / "reports"
 MODEL_INFO_CACHE_TTL_S = 15
 MAX_INCREMENTAL_CATCHUP_GAP = 10
@@ -726,6 +728,16 @@ class ScoringServer:
         self._report_state_path = self.report_dir / "scorer_runtime_state.json"
         self._model_info_cache: Optional[Dict[str, Any]] = None
         self._model_info_cache_ts: float = 0.0
+        self.started_at = time.time()
+        self.last_ready_at: Optional[float] = None
+        self.last_state_change_at = self.started_at
+        self.state = "starting"
+        self.state_detail = "initializing"
+        self.ready = False
+        self.accepting_scores = False
+        self.last_baseline_warm_at: Optional[float] = None
+        self.last_baseline_warm_ms: Optional[int] = None
+        self.last_baseline_loss: Optional[float] = None
 
         if self.scorer_address and self.ps_url:
             state = self._load_report_state()
@@ -735,12 +747,89 @@ class ScoringServer:
             else:
                 self._last_balance_total = self._fetch_balance_total()
 
+        self._set_runtime_state("warming", "startup_baseline", ready=False)
+        if self._warm_baseline_cache(reason="startup"):
+            self._set_runtime_state("ready", "serving", ready=True)
+        else:
+            self._set_runtime_state("degraded", "startup_warm_failed", ready=False)
+
         # Start background model update loop (checks PS every 5 min)
         if self.ps_url:
             threading.Thread(target=self._model_update_loop, daemon=True,
                              name="model_update").start()
             log.info(f"[AUTO-UPDATE] Enabled, checking {self.ps_url} every 300s")
             threading.Thread(target=self._epoch_report_loop, daemon=True, name="epoch_report").start()
+
+    def _set_runtime_state(self, state: str, detail: str, *, ready: bool) -> None:
+        now = time.time()
+        self.state = str(state)
+        self.state_detail = str(detail)
+        self.ready = bool(ready)
+        self.accepting_scores = bool(ready and not self.busy)
+        self.last_state_change_at = now
+        if self.ready:
+            self.last_ready_at = now
+        log.info(f"[STATE] state={self.state} detail={self.state_detail} ready={self.ready}")
+
+    def _status_payload(self) -> Dict[str, Any]:
+        avg_ms = (self.total_time / self.scored_count * 1000) if self.scored_count > 0 else 0
+        device_info = dict(self.device_info)
+        return {
+            "status": "ok",
+            "state": self.state,
+            "state_detail": self.state_detail,
+            "ready": self.ready,
+            "accepting_scores": bool(self.ready and not self.busy),
+            "busy": self.busy,
+            "busy_seconds": round(time.time() - self._busy_since) if self.busy else 0,
+            "device": self.device,
+            "model_dtype": self.model_dtype,
+            "model_version": self.model_version,
+            "scored_count": self.scored_count,
+            "avg_score_ms": round(avg_ms),
+            "validation_shards": len(self.validation_shards),
+            "gpu_model": device_info.get("gpu_model"),
+            "gpu_vram_gb": device_info.get("gpu_vram_gb"),
+            "cpu_model": device_info.get("cpu_model"),
+            "ram_gb": device_info.get("ram_gb"),
+            "os": device_info.get("os"),
+            "arch": device_info.get("arch"),
+            "started_at": self.started_at,
+            "last_ready_at": self.last_ready_at,
+            "last_state_change_at": self.last_state_change_at,
+            "baseline_cache_entries": len(self.validation_shards[:1]),
+            "last_baseline_warm_at": self.last_baseline_warm_at,
+            "last_baseline_warm_ms": self.last_baseline_warm_ms,
+            "last_baseline_loss": self.last_baseline_loss,
+        }
+
+    def _warm_baseline_cache(self, reason: str) -> bool:
+        selected_shards = self.validation_shards[:1]
+        if not selected_shards:
+            self.last_baseline_warm_at = time.time()
+            self.last_baseline_warm_ms = 0
+            self.last_baseline_loss = None
+            log.warning(f"[WARMUP] skipped reason={reason}: no validation shards")
+            return False
+
+        try:
+            t0 = time.time()
+            loss = self._validate_blocking(selected_shards)
+            elapsed_ms = int((time.time() - t0) * 1000)
+            self.last_baseline_warm_at = time.time()
+            self.last_baseline_warm_ms = elapsed_ms
+            self.last_baseline_loss = float(loss)
+            log.info(
+                f"[WARMUP] baseline cache warmed reason={reason} elapsed_ms={elapsed_ms} "
+                f"loss={float(loss):.6f} shards={len(selected_shards)}"
+            )
+            return True
+        except Exception as exc:
+            self.last_baseline_warm_at = time.time()
+            self.last_baseline_warm_ms = None
+            self.last_baseline_loss = None
+            log.error(f"[WARMUP] failed reason={reason}: {exc}", exc_info=True)
+            return False
 
     def _load_report_state(self) -> Dict[str, Any]:
         try:
@@ -1042,6 +1131,17 @@ class ScoringServer:
             log.info(f"[IDEMPOTENT] Returning cached result for {sid}")
             return web.json_response(self._scored_results[sid])
 
+        if not self.ready:
+            return web.json_response(
+                {
+                    "error": "worker_not_ready",
+                    "submission_id": sid,
+                    "state": self.state,
+                    "state_detail": self.state_detail,
+                },
+                status=503,
+            )
+
         # --- Model version check ---
         if body["model_version"] != self.model_version:
             log.warning(
@@ -1065,6 +1165,7 @@ class ScoringServer:
 
         self.busy = True
         self._busy_since = time.time()
+        self.accepting_scores = False
         t0 = time.time()
 
         try:
@@ -1131,6 +1232,7 @@ class ScoringServer:
             )
         finally:
             self.busy = False
+            self.accepting_scores = self.ready
 
     # ================================================================
     # Background model auto-update (delta / full download from PS)
@@ -1277,6 +1379,7 @@ class ScoringServer:
             if self.busy:
                 log.info(f"[AUTO-UPDATE] gap={gap} > {MAX_INCREMENTAL_CATCHUP_GAP}, need full download but busy — defer")
                 return
+            self._set_runtime_state("updating", f"full_download_v{live_version}", ready=False)
             full_version = self._select_full_download_version(live_version, published_full_version)
             log.info(f"[AUTO-UPDATE] gap={gap} large, downloading full model v{full_version}...")
             self._download_full_model_sync(
@@ -1315,6 +1418,7 @@ class ScoringServer:
             self._pending_deltas = fetched
             log.info(f"[AUTO-UPDATE] Fetched {len(fetched)} epoch update(s), stashed (worker busy)")
         else:
+            self._set_runtime_state("updating", f"delta_to_v{available_update_version}", ready=False)
             for from_ver, payload in fetched:
                 if not self._apply_delta(payload, from_ver):
                     full_version = self._select_full_download_version(live_version, published_full_version)
@@ -1325,6 +1429,10 @@ class ScoringServer:
                         allow_ps_fallback=True,
                     )
                     return
+            if self._warm_baseline_cache(reason=f"delta_to_v{self.model_version}"):
+                self._set_runtime_state("ready", "serving", ready=True)
+            else:
+                self._set_runtime_state("degraded", "delta_warm_failed", ready=False)
             log.info(f"[AUTO-UPDATE] ✅ Incremental update complete → v{self.model_version}")
 
         if published_update_version < live_version and self.model_version < live_version:
@@ -1529,6 +1637,10 @@ class ScoringServer:
                 self.model_dtype = resolved_dtype_name
                 self.model_version = target_version
                 self._scored_results.clear()
+            if self._warm_baseline_cache(reason=f"full_download_v{target_version}"):
+                self._set_runtime_state("ready", "serving", ready=True)
+            else:
+                self._set_runtime_state("degraded", "full_download_warm_failed", ready=False)
 
             log.info(f"[AUTO-UPDATE] ✅ Full model v{target_version} loaded, hot-reloaded")
 
@@ -1543,28 +1655,26 @@ class ScoringServer:
 
     async def handle_health(self, request: web.Request) -> web.Response:
         """GET /health — liveness + status"""
-        avg_ms = (self.total_time / self.scored_count * 1000) if self.scored_count > 0 else 0
-        device_info = dict(self.device_info)
-        return web.json_response({
-            "status": "ok",
-            "device": self.device,
-            "model_dtype": self.model_dtype,
-            "model_version": self.model_version,
-            "busy": self.busy,
-            "busy_seconds": round(time.time() - self._busy_since) if self.busy else 0,
-            "scored_count": self.scored_count,
-            "avg_score_ms": round(avg_ms),
-            "validation_shards": len(self.validation_shards),
-            "gpu_model": device_info.get("gpu_model"),
-            "gpu_vram_gb": device_info.get("gpu_vram_gb"),
-            "cpu_model": device_info.get("cpu_model"),
-            "ram_gb": device_info.get("ram_gb"),
-            "os": device_info.get("os"),
-            "arch": device_info.get("arch"),
-        })
+        return web.json_response(self._status_payload())
+
+    async def handle_status(self, request: web.Request) -> web.Response:
+        return web.json_response(self._status_payload())
+
+    async def handle_ready(self, request: web.Request) -> web.Response:
+        payload = self._status_payload()
+        return web.json_response(payload, status=200 if self.ready else 503)
 
     async def handle_validate(self, request: web.Request) -> web.Response:
         """POST /validate — compute validation loss on held-out shards."""
+        if not self.ready:
+            return web.json_response(
+                {
+                    "error": "worker_not_ready",
+                    "state": self.state,
+                    "state_detail": self.state_detail,
+                },
+                status=503,
+            )
         if self.busy:
             return web.json_response({"error": "worker_busy"}, status=503)
 
@@ -1601,6 +1711,7 @@ class ScoringServer:
 
         self.busy = True
         self._busy_since = time.time()
+        self.accepting_scores = False
         try:
             avg_loss = await asyncio.to_thread(self._validate_blocking, selected_shards)
             return web.json_response(
@@ -1616,6 +1727,7 @@ class ScoringServer:
             return web.json_response({"error": str(e)}, status=500)
         finally:
             self.busy = False
+            self.accepting_scores = self.ready
 
     async def _download_model(self, url: str, dest: str) -> str:
         """Download model from URL with streaming + progress logging."""
@@ -1680,6 +1792,8 @@ class ScoringServer:
 
             self.busy = True
             self._busy_since = time.time()
+            self.accepting_scores = False
+            self._set_runtime_state("reloading", "reload_request", ready=False)
 
             # If download_url provided, download first
             if download_url:
@@ -1700,6 +1814,10 @@ class ScoringServer:
             if not self._promote_checkpoint_baseline(model_path, new_version):
                 if not self._persist_current_baseline(new_version):
                     log.warning(f"[RELOAD] Model v{new_version} loaded but baseline persist failed")
+            if self._warm_baseline_cache(reason=f"reload_v{new_version}"):
+                self._set_runtime_state("ready", "serving", ready=True)
+            else:
+                self._set_runtime_state("degraded", "reload_warm_failed", ready=False)
 
             log.info(f"[RELOAD] Model v{new_version} loaded successfully")
             return web.json_response({
@@ -1710,10 +1828,12 @@ class ScoringServer:
                 "downloaded": bool(download_url),
             })
         except Exception as e:
+            self._set_runtime_state("degraded", "reload_failed", ready=False)
             log.error(f"[RELOAD] Failed: {e}", exc_info=True)
             return web.json_response({"error": str(e)}, status=500)
         finally:
             self.busy = False
+            self.accepting_scores = self.ready
 
 
 # =============================================================================
@@ -1761,6 +1881,7 @@ def start_endpoint_registration_loop(
     scorer_address: str,
     public_endpoint: str,
     model_version_ref,
+    local_ready_url: str = "",
 ):
     if not ps_url or not scorer_address or not public_endpoint:
         return
@@ -1768,6 +1889,15 @@ def start_endpoint_registration_loop(
     def _loop():
         while True:
             try:
+                if local_ready_url:
+                    try:
+                        ready_resp = requests.get(local_ready_url, timeout=5)
+                        if ready_resp.status_code != 200:
+                            time.sleep(SCORER_REGISTER_BOOT_POLL_S)
+                            continue
+                    except Exception:
+                        time.sleep(SCORER_REGISTER_BOOT_POLL_S)
+                        continue
                 register_scorer_endpoint(
                     ps_url=ps_url,
                     scorer_address=scorer_address,
@@ -1776,7 +1906,7 @@ def start_endpoint_registration_loop(
                 )
             except Exception as exc:
                 log.warning(f"[SCORER REGISTER] loop error: {exc}")
-            time.sleep(60)
+            time.sleep(SCORER_REGISTER_INTERVAL_S)
 
     threading.Thread(target=_loop, daemon=True, name="scorer_endpoint_register").start()
 
@@ -1854,6 +1984,8 @@ def main():
     app = web.Application()
     app.router.add_post("/score", server.handle_score)
     app.router.add_get("/health", server.handle_health)
+    app.router.add_get("/status", server.handle_status)
+    app.router.add_get("/ready", server.handle_ready)
     app.router.add_post("/validate", server.handle_validate)
     app.router.add_post("/reload", server.handle_reload_model)
 
@@ -1863,20 +1995,15 @@ def main():
     log.info(f"  Model version: {resolved_model_version}")
     log.info(f"  Model path: {resolved_model_path}")
     log.info(f"  Validation shards: {len(validation_shards)}")
-    log.info(f"  Endpoints: POST /score, POST /validate, GET /health, POST /reload")
+    log.info(f"  Endpoints: POST /score, POST /validate, GET /health, GET /status, GET /ready, POST /reload")
 
     if args.ps_url and args.scorer_address and args.public_endpoint:
-        register_scorer_endpoint(
-            ps_url=args.ps_url,
-            scorer_address=args.scorer_address,
-            public_endpoint=args.public_endpoint,
-            model_version=resolved_model_version,
-        )
         start_endpoint_registration_loop(
             ps_url=args.ps_url,
             scorer_address=args.scorer_address,
             public_endpoint=args.public_endpoint,
             model_version_ref=lambda: server.model_version,
+            local_ready_url=f"http://127.0.0.1:{args.port}/ready",
         )
     elif args.scorer_address or args.public_endpoint:
         log.warning("[SCORER REGISTER] both --scorer-address and --public-endpoint are required for PS endpoint registration")
