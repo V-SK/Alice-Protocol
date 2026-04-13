@@ -38,6 +38,13 @@ PARAM_DIFF_SPOOL_ARCHIVE_DIR = PARAM_DIFF_OUTBOX_DIR / "archived"
 UPLOAD_LEASE_REFRESH_BUFFER_S = 60
 ZERO_SHARD_REREGISTER_THRESHOLD = 3
 EPOCH_ROLLOVER_WAIT_BUFFER_S = 30
+UPLOAD_CONNECT_TIMEOUT_S = 15
+UPLOAD_READ_TIMEOUT_S = 900
+FINALIZE_READ_TIMEOUT_S = 180
+UPLOAD_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+UPLOAD_LAYER_MAX_RETRIES = 5
+FINALIZE_MAX_RETRIES = 4
+UPLOAD_RETRY_BASE_DELAY_S = 5
 
 
 def _plan_b_log(message: str) -> None:
@@ -50,6 +57,23 @@ def _safe_layer_name(name: str) -> str:
 
 def _normalize_url(url: str) -> str:
     return str(url or "").strip().rstrip("/")
+
+
+def _http_retry_delay_seconds(attempt: int, *, base_delay_s: int = UPLOAD_RETRY_BASE_DELAY_S, max_delay_s: int = 60) -> int:
+    return max(1, min(max_delay_s, int(base_delay_s * max(1, attempt))))
+
+
+def _response_error_summary(resp: requests.Response) -> str:
+    try:
+        body = (resp.text or "").strip()
+    except Exception:
+        body = ""
+    if body:
+        body = " ".join(body.split())
+        if len(body) > 240:
+            body = f"{body[:237]}..."
+        return f"HTTP {resp.status_code}: {body}"
+    return f"HTTP {resp.status_code}"
 
 
 def _coerce_version(value: Any) -> Optional[int]:
@@ -676,23 +700,54 @@ class LocalTrainer:
             layer_name = Path(filepath).stem
             headers = dict(upload_headers)
             headers["X-Layer-Name"] = layer_name
-            try:
-                with open(filepath, "rb") as handle:
-                    resp = requests.post(
-                        f"{self._runtime_data_plane_url()}/delta/upload_layer",
-                        data=handle.read(),
-                        headers=headers,
-                        timeout=120,
-                    )
-                if resp.status_code in (401, 403, 404, 410, 501):
-                    self._archive_spool(
-                        metadata,
-                        f"upload_layer_http_{resp.status_code}_{layer_name}",
-                    )
-                    return True
-                resp.raise_for_status()
-            except Exception as exc:
-                _plan_b_log(f"Param diff upload failed for {layer_name}: {exc}")
+            last_error: Optional[Exception] = None
+            upload_url = f"{self._runtime_data_plane_url()}/delta/upload_layer"
+            for attempt in range(1, UPLOAD_LAYER_MAX_RETRIES + 1):
+                try:
+                    with open(filepath, "rb") as handle:
+                        resp = requests.post(
+                            upload_url,
+                            data=handle,
+                            headers=headers,
+                            timeout=(UPLOAD_CONNECT_TIMEOUT_S, UPLOAD_READ_TIMEOUT_S),
+                        )
+                    if resp.status_code in (401, 403, 404, 410, 501):
+                        self._archive_spool(
+                            metadata,
+                            f"upload_layer_http_{resp.status_code}_{layer_name}",
+                        )
+                        return True
+                    if resp.status_code in UPLOAD_RETRYABLE_STATUS_CODES:
+                        detail = _response_error_summary(resp)
+                        last_error = RuntimeError(detail)
+                        if attempt < UPLOAD_LAYER_MAX_RETRIES:
+                            delay_s = _http_retry_delay_seconds(attempt)
+                            _plan_b_log(
+                                f"Param diff upload retry {attempt}/{UPLOAD_LAYER_MAX_RETRIES} for {layer_name}: "
+                                f"{detail}; sleeping {delay_s}s"
+                            )
+                            time.sleep(delay_s)
+                            continue
+                        raise last_error
+                    resp.raise_for_status()
+                    last_error = None
+                    break
+                except requests.RequestException as exc:
+                    last_error = exc
+                    if attempt < UPLOAD_LAYER_MAX_RETRIES:
+                        delay_s = _http_retry_delay_seconds(attempt)
+                        _plan_b_log(
+                            f"Param diff upload retry {attempt}/{UPLOAD_LAYER_MAX_RETRIES} for {layer_name}: "
+                            f"{exc}; sleeping {delay_s}s"
+                        )
+                        time.sleep(delay_s)
+                        continue
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    break
+            if last_error is not None:
+                _plan_b_log(f"Param diff upload failed for {layer_name}: {last_error}")
                 manifest["state"] = "pending_upload"
                 self._write_spool_manifest(manifest)
                 return False
@@ -705,22 +760,53 @@ class LocalTrainer:
             "param_diff_norm": float(metadata.get("param_diff_norm", 0.0) or 0.0),
             "model_version": int(metadata.get("model_version", self.current_model_version or 0) or 0),
         }
-        try:
-            resp = requests.post(
-                f"{self._runtime_data_plane_url()}/delta/finalize",
-                json=finalize_payload,
-                headers=dict(upload_headers),
-                timeout=30,
-            )
-            if resp.status_code in (401, 403, 404, 410, 501):
-                self._archive_spool(
-                    metadata,
-                    f"param_diff_finalize_http_{resp.status_code}",
+        finalize_url = f"{self._runtime_data_plane_url()}/delta/finalize"
+        finalize_error: Optional[Exception] = None
+        for attempt in range(1, FINALIZE_MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    finalize_url,
+                    json=finalize_payload,
+                    headers=dict(upload_headers),
+                    timeout=(UPLOAD_CONNECT_TIMEOUT_S, FINALIZE_READ_TIMEOUT_S),
                 )
-                return True
-            resp.raise_for_status()
-        except Exception as exc:
-            _plan_b_log(f"Param diff finalize failed: {exc}")
+                if resp.status_code in (401, 403, 404, 410, 501):
+                    self._archive_spool(
+                        metadata,
+                        f"param_diff_finalize_http_{resp.status_code}",
+                    )
+                    return True
+                if resp.status_code in UPLOAD_RETRYABLE_STATUS_CODES:
+                    detail = _response_error_summary(resp)
+                    finalize_error = RuntimeError(detail)
+                    if attempt < FINALIZE_MAX_RETRIES:
+                        delay_s = _http_retry_delay_seconds(attempt)
+                        _plan_b_log(
+                            f"Param diff finalize retry {attempt}/{FINALIZE_MAX_RETRIES}: "
+                            f"{detail}; sleeping {delay_s}s"
+                        )
+                        time.sleep(delay_s)
+                        continue
+                    raise finalize_error
+                resp.raise_for_status()
+                finalize_error = None
+                break
+            except requests.RequestException as exc:
+                finalize_error = exc
+                if attempt < FINALIZE_MAX_RETRIES:
+                    delay_s = _http_retry_delay_seconds(attempt)
+                    _plan_b_log(
+                        f"Param diff finalize retry {attempt}/{FINALIZE_MAX_RETRIES}: "
+                        f"{exc}; sleeping {delay_s}s"
+                    )
+                    time.sleep(delay_s)
+                    continue
+                break
+            except Exception as exc:
+                finalize_error = exc
+                break
+        if finalize_error is not None:
+            _plan_b_log(f"Param diff finalize failed: {finalize_error}")
             manifest["state"] = "pending_upload"
             self._write_spool_manifest(manifest)
             return False
