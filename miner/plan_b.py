@@ -6,9 +6,11 @@ import gc
 import io
 import json
 import os
+import shutil
 import tempfile
 import threading
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -33,6 +35,9 @@ BATCH_RESTORE_SUCCESS_SHARDS = 3
 MAX_OOM_RETRIES_AT_BATCH1 = 3
 MODEL_INFO_CACHE_TTL_S = 15
 PARAM_DIFF_SPOOL_ARCHIVE_DIR = PARAM_DIFF_OUTBOX_DIR / "archived"
+UPLOAD_LEASE_REFRESH_BUFFER_S = 60
+ZERO_SHARD_REREGISTER_THRESHOLD = 3
+EPOCH_ROLLOVER_WAIT_BUFFER_S = 30
 
 
 def _plan_b_log(message: str) -> None:
@@ -122,6 +127,38 @@ def _version_marker_path() -> Path:
     return PLAN_B_MODEL_DIR / "current_version"
 
 
+def _should_keep_param_fp32(name: str, param: Optional[torch.Tensor] = None) -> bool:
+    if param is not None and not torch.is_floating_point(param):
+        return False
+    return (
+        name == "model.norm.weight"
+        or name.endswith("input_layernorm.weight")
+        or name.endswith("post_attention_layernorm.weight")
+    )
+
+
+def _preserve_high_precision_params(module: torch.nn.Module) -> int:
+    preserved = 0
+    with torch.no_grad():
+        for name, param in module.named_parameters():
+            if not _should_keep_param_fp32(name, param):
+                continue
+            if param.dtype != torch.float32:
+                param.data = param.data.float()
+            preserved += 1
+    return preserved
+
+
+def _parse_cached_model_version(path: Path, prefix: str, suffix: str) -> Optional[int]:
+    name = path.name
+    if not name.startswith(prefix) or not name.endswith(suffix):
+        return None
+    raw = name[len(prefix) : len(name) - len(suffix)]
+    if not raw.isdigit():
+        return None
+    return int(raw)
+
+
 class LocalTrainer:
     def __init__(
         self,
@@ -131,6 +168,7 @@ class LocalTrainer:
         aggregator_url: str,
         miner_address: str,
         auth: miner_lib.AtomicTokenHolder,
+        capabilities: Dict[str, Any],
         args: Any,
         miner_instance_id: Optional[str] = None,
     ) -> None:
@@ -141,6 +179,7 @@ class LocalTrainer:
         self.miner_address = str(miner_address)
         self.miner_instance_id = str(miner_instance_id or miner_address)
         self.auth = auth
+        self.capabilities = dict(capabilities)
         self.args = args
         self.snapshot_dir = SNAPSHOT_DIR
         self.param_diff_outbox_dir = PARAM_DIFF_OUTBOX_DIR
@@ -157,9 +196,12 @@ class LocalTrainer:
         self._model_info_cache: Optional[Dict[str, Any]] = None
         self._model_info_cache_ts: float = 0.0
         self.epoch_start_time: float = time.time()
+        self._task_context: Optional[Dict[str, Any]] = None
+        self._submit_window_log_mode: Optional[str] = None
 
     def mark_epoch_start(self) -> None:
         self.epoch_start_time = time.time()
+        self._submit_window_log_mode = None
 
     def _write_local_version_marker(self, version: int) -> None:
         PLAN_B_MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -262,6 +304,15 @@ class LocalTrainer:
 
     def _plan_b_headers(self) -> Dict[str, str]:
         headers = dict(self._headers())
+        miner_identity = str(self.auth.miner_id or self.miner_instance_id or "").strip()
+        if miner_identity:
+            headers["X-Miner-Id"] = miner_identity
+        miner_address = str(self.miner_address or "").strip()
+        if miner_address:
+            headers["X-Miner-Address"] = miner_address
+        instance_identity = str(self.miner_instance_id or "").strip()
+        if instance_identity:
+            headers["X-Instance-Id"] = instance_identity
         headers["X-Delta-Semantics"] = PLAN_B_DELTA_SEMANTICS
         headers["X-Plan-B-Protocol-Version"] = PLAN_B_PROTOCOL_VERSION
         return headers
@@ -269,11 +320,78 @@ class LocalTrainer:
     def _runtime_data_plane_url(self) -> str:
         return _normalize_url(self.auth.data_plane_url or self.aggregator_url)
 
+    def update_task_context(self, task: Dict[str, Any]) -> None:
+        normalized = dict(task or {})
+        task_id = str(normalized.get("task_id") or "").strip()
+        assignment_token = str(normalized.get("assignment_token") or "").strip()
+        assignment_epoch = normalized.get("assignment_epoch", normalized.get("epoch"))
+        if not task_id or not assignment_token or assignment_epoch is None:
+            self._task_context = None
+            return
+        normalized["task_id"] = task_id
+        normalized["assignment_token"] = assignment_token
+        normalized["assignment_epoch"] = int(assignment_epoch)
+        normalized["deadline"] = str(normalized.get("deadline") or "").strip()
+        self._task_context = normalized
+
+    def _task_deadline_ts(self) -> Optional[float]:
+        deadline = str((self._task_context or {}).get("deadline") or "").strip()
+        if not deadline:
+            return None
+        try:
+            return datetime.fromisoformat(deadline.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    def _task_context_expiring(self, buffer_s: int = UPLOAD_LEASE_REFRESH_BUFFER_S) -> bool:
+        if not self._task_context:
+            return True
+        deadline_ts = self._task_deadline_ts()
+        if deadline_ts is None:
+            return True
+        return deadline_ts <= (time.time() + max(0, int(buffer_s)))
+
+    def ensure_upload_task_context(self, buffer_s: int = UPLOAD_LEASE_REFRESH_BUFFER_S) -> bool:
+        if not self._task_context_expiring(buffer_s):
+            return True
+
+        _plan_b_log("Refreshing upload lease from PS before param_diff submission")
+        task, status = miner_lib.request_task_with_retry(
+            self.ps_url,
+            str(self.auth.miner_id or self.miner_instance_id),
+            self.capabilities,
+            auth_token=self.auth.token,
+            retry_delay=5,
+            max_attempts=3,
+        )
+        if status != "ok" or task is None:
+            _plan_b_log(f"Upload lease refresh failed: status={status}")
+            return False
+
+        self.update_task_batch_size(task)
+        self.update_task_context(task)
+        return self._task_context is not None
+
+    def _task_upload_headers(self) -> Dict[str, str]:
+        if not self.ensure_upload_task_context():
+            raise RuntimeError("upload_task_context_unavailable")
+        task_context = dict(self._task_context or {})
+        headers = self._plan_b_headers()
+        headers["X-Task-Id"] = str(task_context["task_id"])
+        headers["X-Assignment-Token"] = str(task_context["assignment_token"])
+        headers["X-Epoch"] = str(int(task_context["assignment_epoch"]))
+        return headers
+
     def _target_batch_size(self) -> int:
         ps_cap = max(1, int(self.assigned_batch_size or 0) or 2)
         user_override = int(getattr(self.args, "batch_size", 0) or 0)
         if user_override > 0:
-            return max(1, user_override)
+            effective = max(1, min(user_override, ps_cap))
+            if effective != user_override:
+                _plan_b_log(
+                    f"Clamping local batch_size {user_override} to PS assigned cap {ps_cap}"
+                )
+            return effective
         return ps_cap
 
     def _log_batch_decision(self, source: str) -> None:
@@ -318,7 +436,11 @@ class LocalTrainer:
         files_written = 0
         for name, param in self.model.named_parameters():
             path = self.snapshot_dir / f"{_safe_layer_name(name)}.pt"
-            tensor = param.detach().clone().cpu().half()
+            tensor = param.detach().clone().cpu()
+            if _should_keep_param_fp32(name, param):
+                tensor = tensor.float()
+            else:
+                tensor = tensor.half()
             torch.save(tensor, path)
             files_written += 1
         _plan_b_log(f"Saved global snapshot: {files_written} files -> {self.snapshot_dir}")
@@ -456,6 +578,8 @@ class LocalTrainer:
         total_entries = 0
         total_bytes = 0
         total_norm_sq = 0.0
+        skipped_zero_layers = 0
+        processed_layers = 0
         param_diff_norm_per_layer: Dict[str, float] = {}
         layer_files: List[str] = []
         ratio = float(
@@ -480,6 +604,11 @@ class LocalTrainer:
             flat = param_diff.flatten()
             if flat.numel() == 0:
                 continue
+            max_abs = float(flat.abs().max().item())
+            if max_abs == 0.0:
+                _plan_b_log(f"[PARAM-DIFF] Skipping zero-diff layer: {name}")
+                skipped_zero_layers += 1
+                continue
             k = max(1, int(flat.numel() * ratio))
             _, topk_idx = torch.topk(flat.abs(), k)
             topk_vals = flat[topk_idx].float()
@@ -498,6 +627,7 @@ class LocalTrainer:
             total_entries += int(topk_idx.numel())
             total_bytes += output_path.stat().st_size
             layer_files.append(output_path.name)
+            processed_layers += 1
 
         param_diff_norm = total_norm_sq ** 0.5
         metadata = {
@@ -520,6 +650,10 @@ class LocalTrainer:
         materialized = self._read_spool_manifest(manifest_path)
         if materialized is None:
             raise RuntimeError("Failed to materialize param_diff spool manifest")
+        if skipped_zero_layers > 0:
+            _plan_b_log(
+                f"[PARAM-DIFF] Summary: processed={processed_layers}, skipped_zero={skipped_zero_layers}"
+            )
         _plan_b_log(
             f"Compressed param_diff: layers={len(layer_files)}, entries={total_entries}, bytes={total_bytes}, "
             f"norm={param_diff_norm:.4f}, spool={spool_dir}"
@@ -531,9 +665,16 @@ class LocalTrainer:
         manifest["state"] = "uploading"
         self._write_spool_manifest(manifest)
         layer_files = metadata.get("layer_files") or []
+        try:
+            upload_headers = self._task_upload_headers()
+        except Exception as exc:
+            _plan_b_log(f"Cannot upload param_diff without fresh task lease: {exc}")
+            manifest["state"] = "pending_upload"
+            self._write_spool_manifest(manifest)
+            return False
         for filepath in layer_files:
             layer_name = Path(filepath).stem
-            headers = self._plan_b_headers()
+            headers = dict(upload_headers)
             headers["X-Layer-Name"] = layer_name
             try:
                 with open(filepath, "rb") as handle:
@@ -568,7 +709,7 @@ class LocalTrainer:
             resp = requests.post(
                 f"{self._runtime_data_plane_url()}/delta/finalize",
                 json=finalize_payload,
-                headers=self._plan_b_headers(),
+                headers=dict(upload_headers),
                 timeout=30,
             )
             if resp.status_code in (401, 403, 404, 410, 501):
@@ -599,20 +740,48 @@ class LocalTrainer:
             f"{self.ps_url}/epoch/current",
             f"{self.ps_url}/health",
         ]
+        fallback_health: Optional[Dict[str, Any]] = None
         for url in candidates:
             try:
                 resp = requests.get(url, headers=self._plan_b_headers(), timeout=10)
                 if resp.status_code != 200:
                     continue
                 data = resp.json()
-                if isinstance(data, dict):
+                if not isinstance(data, dict):
+                    continue
+                has_epoch_timing = self._extract_epoch_remaining_seconds(data) is not None
+                has_epoch_number = self._extract_epoch_number(data) is not None
+                if has_epoch_timing or has_epoch_number:
                     self._status_cache = data
                     self._status_cache_ts = now
                     return data
+                if url.endswith("/health"):
+                    fallback_health = data
             except Exception:
                 continue
+        cached = self._status_cache if isinstance(self._status_cache, dict) else None
+        if cached:
+            cached_has_epoch_timing = self._extract_epoch_remaining_seconds(cached) is not None
+            cached_has_epoch_number = self._extract_epoch_number(cached) is not None
+            if cached_has_epoch_timing or cached_has_epoch_number:
+                if fallback_health is not None:
+                    merged = dict(cached)
+                    merged.update(fallback_health)
+                    self._status_cache = merged
+                    self._status_cache_ts = now
+                    _plan_b_log(
+                        "PS /status unavailable; preserving cached epoch timing instead of degrading to /health"
+                    )
+                    return merged
+                return cached
+        if fallback_health is not None:
+            self._status_cache = fallback_health
+            self._status_cache_ts = now
+            _plan_b_log("PS /status unavailable and /health has no epoch timing; falling back to local submit timer")
+            return fallback_health
         self._status_cache = {}
         self._status_cache_ts = now
+        _plan_b_log("PS status fetch failed; falling back to local submit timer")
         return {}
 
     def _fetch_model_info(self, force: bool = False) -> Dict[str, Any]:
@@ -885,6 +1054,54 @@ class LocalTrainer:
             with contextlib.suppress(FileNotFoundError):
                 tmp_path.unlink()
             _plan_b_log(f"Removed stale partial full model: {tmp_path.name}")
+        current_version = int(self.current_model_version or 0)
+        if current_version > 0:
+            for path in PLAN_B_MODEL_DIR.glob("update_v*.pt"):
+                version = _parse_cached_model_version(path, prefix="update_v", suffix=".pt")
+                if version is None or version > current_version:
+                    continue
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+                _plan_b_log(f"Removed stale cached epoch update: {path.name}")
+        for tmp_path in PLAN_B_MODEL_DIR.glob("update_v*.pt.tmp"):
+            with contextlib.suppress(FileNotFoundError):
+                tmp_path.unlink()
+            _plan_b_log(f"Removed stale partial epoch update: {tmp_path.name}")
+
+    def _prepare_storage_for_full_download(self, target_version: int, min_free_gb: float = 14.0) -> None:
+        min_free_bytes = int(float(min_free_gb) * (1024 ** 3))
+        total, used, free = shutil.disk_usage(str(PLAN_B_MODEL_DIR))
+        if free >= min_free_bytes:
+            return
+        _plan_b_log(
+            f"Low disk before full model download v{target_version}: free={free / (1024 ** 3):.2f} GB. "
+            "Cleaning stale caches."
+        )
+        for path in sorted(PLAN_B_MODEL_DIR.glob("full_model_v*.pt")):
+            version = _parse_cached_model_version(path, prefix="full_model_v", suffix=".pt")
+            if version is None or version == int(target_version):
+                continue
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+            _plan_b_log(f"Removed old cached full model before download: {path.name}")
+        for pattern, reason in (
+            ("full_model_v*.pt.tmp", "stale partial full model"),
+            ("update_v*.pt", "stale cached epoch update"),
+            ("update_v*.pt.tmp", "stale partial epoch update"),
+        ):
+            for path in sorted(PLAN_B_MODEL_DIR.glob(pattern)):
+                with contextlib.suppress(FileNotFoundError):
+                    path.unlink()
+                _plan_b_log(f"Removed {reason} before download: {path.name}")
+        cache_dir = Path.home() / ".cache" / "pip"
+        if cache_dir.exists():
+            with contextlib.suppress(Exception):
+                shutil.rmtree(cache_dir)
+            _plan_b_log("Removed pip cache to recover disk space")
+        _, _, free_after = shutil.disk_usage(str(PLAN_B_MODEL_DIR))
+        _plan_b_log(
+            f"Disk after cleanup for full model v{target_version}: free={free_after / (1024 ** 3):.2f} GB"
+        )
 
     def _find_best_local_model(self, target_version: Optional[int]) -> Optional[int]:
         marker_version = self._read_local_version_marker()
@@ -945,6 +1162,9 @@ class LocalTrainer:
         gc.collect()
         if self.device.type in ("cuda", "mps") and precision_mode != "fp32":
             model = model.half()
+            preserved = _preserve_high_precision_params(model)
+            if preserved > 0:
+                _plan_b_log(f"Preserving fp32 for {preserved} normalization scale tensors")
         if hasattr(model, "gradient_checkpointing_enable"):
             model.gradient_checkpointing_enable()
         with torch.no_grad():
@@ -969,12 +1189,8 @@ class LocalTrainer:
         if self.model is not None and self.current_model_version == target_version:
             _plan_b_log(f"Full model v{target_version} already loaded")
             return target_version
-        if self.model is not None:
-            _plan_b_log(
-                f"Switching full model v{self.current_model_version} -> v{target_version}; releasing old model first"
-            )
-            self._release_loaded_model()
         if not model_path.exists():
+            self._prepare_storage_for_full_download(target_version)
             _plan_b_log(f"Downloading full model for version {target_version}")
             self._download_full_model_from_mirrors(
                 target_version,
@@ -983,6 +1199,11 @@ class LocalTrainer:
             )
         else:
             _plan_b_log(f"Using cached full model: {model_path}")
+        if self.model is not None:
+            _plan_b_log(
+                f"Switching full model v{self.current_model_version} -> v{target_version}; releasing old model first"
+            )
+            self._release_loaded_model()
         state_dict = torch.load(model_path, map_location="cpu", mmap=True, weights_only=True)
         self.model = self._load_model_from_state_dict(state_dict)
         self.current_model_version = target_version
@@ -1087,16 +1308,83 @@ class LocalTrainer:
                 return
             self._apply_epoch_update_payload(update, from_version)
 
+    def _extract_epoch_remaining_seconds(self, status: Dict[str, Any]) -> Optional[float]:
+        candidate_paths = (
+            ("remaining_seconds",),
+            ("epoch_remaining_seconds",),
+            ("epoch_remaining_s",),
+            ("seconds_left",),
+            ("time_remaining",),
+            ("remaining_s",),
+            ("epoch_tracker", "remaining_seconds"),
+            ("epoch_tracker", "epoch_remaining_seconds"),
+            ("epoch_tracker", "epoch_remaining_s"),
+            ("epoch_tracker", "seconds_left"),
+            ("epoch_tracker", "time_remaining"),
+            ("epoch_tracker", "remaining_s"),
+        )
+        for path in candidate_paths:
+            current: Any = status
+            for key in path:
+                if not isinstance(current, dict):
+                    current = None
+                    break
+                current = current.get(key)
+            if isinstance(current, (int, float)):
+                return float(current)
+            if isinstance(current, str):
+                with contextlib.suppress(ValueError):
+                    return float(current)
+        return None
+
+    def _extract_epoch_number(self, status: Dict[str, Any]) -> Optional[int]:
+        candidate_paths = (
+            ("local_epoch",),
+            ("current_epoch",),
+            ("epoch",),
+            ("epoch_number",),
+            ("epoch_tracker", "epoch"),
+            ("epoch_tracker", "epoch_number"),
+            ("epoch_tracker", "current_epoch"),
+        )
+        for path in candidate_paths:
+            current: Any = status
+            for key in path:
+                if not isinstance(current, dict):
+                    current = None
+                    break
+                current = current.get(key)
+            if isinstance(current, bool):
+                continue
+            if isinstance(current, int):
+                return int(current)
+            if isinstance(current, float):
+                return int(current)
+            if isinstance(current, str):
+                stripped = current.strip()
+                if stripped.isdigit():
+                    return int(stripped)
+        return None
+
     def epoch_ending(self) -> bool:
         status = self._fetch_status()
-        for key in ("remaining_seconds", "epoch_remaining_seconds", "epoch_remaining_s", "seconds_left"):
-            value = status.get(key)
-            if isinstance(value, (int, float)):
-                return float(value) < SUBMIT_WINDOW_S
-            if isinstance(value, str):
-                with contextlib.suppress(ValueError):
-                    return float(value) < SUBMIT_WINDOW_S
-        return (time.time() - self.epoch_start_time) >= TRAINING_WINDOW_S
+        remaining_s = self._extract_epoch_remaining_seconds(status)
+        if remaining_s is not None:
+            if remaining_s < SUBMIT_WINDOW_S:
+                if self._submit_window_log_mode != "status":
+                    _plan_b_log(f"Entering submit window from PS status: remaining_s={remaining_s:.1f}")
+                    self._submit_window_log_mode = "status"
+                return True
+            return False
+        fallback_elapsed_s = time.time() - self.epoch_start_time
+        if fallback_elapsed_s >= TRAINING_WINDOW_S:
+            if self._submit_window_log_mode != "fallback":
+                _plan_b_log(
+                    f"Entering submit window from local fallback timer: elapsed_s={fallback_elapsed_s:.1f}"
+                )
+                self._submit_window_log_mode = "fallback"
+            return True
+        return False
 
 
 def notify_shard_complete(
@@ -1105,6 +1393,10 @@ def notify_shard_complete(
     task: Dict[str, Any],
     avg_loss: float,
 ) -> bool:
+    # PS-issued tasks carry an assignment lease and should be confirmed via
+    # the PS control-plane only. Aggregator shard-complete is a legacy path.
+    if str(task.get("assignment_token") or "").strip():
+        return False
     payload = {
         "task_id": task.get("task_id"),
         "shard_id": task.get("shard_id"),
@@ -1117,7 +1409,7 @@ def notify_shard_complete(
             headers=auth.headers,
             timeout=15,
         )
-        if resp.status_code in (404, 501):
+        if resp.status_code in (403, 404, 501):
             _plan_b_log(f"Shard-complete endpoint unavailable ({resp.status_code}); telemetry deferred until Day 2")
             return False
         resp.raise_for_status()
@@ -1210,10 +1502,72 @@ def wait_for_next_epoch(trainer: LocalTrainer, poll_interval_s: int = 15) -> Non
             waited_s = 0
 
 
+def wait_for_epoch_rollover(trainer: LocalTrainer, poll_interval_s: int = 15) -> bool:
+    """
+    Wait for the current epoch window to roll over before trying to train again.
+
+    This is used only for the zero-shard recovery path. It avoids treating
+    "already at latest model version" as evidence that a new epoch has started.
+    """
+    initial_status = trainer._fetch_status(force=True)
+    start_epoch = trainer._extract_epoch_number(initial_status)
+    start_remaining_s = trainer._extract_epoch_remaining_seconds(initial_status)
+    max_wait_s = int(
+        max(
+            poll_interval_s * 2,
+            (start_remaining_s if start_remaining_s is not None else SUBMIT_WINDOW_S)
+            + SUBMIT_WINDOW_S
+            + EPOCH_ROLLOVER_WAIT_BUFFER_S,
+        )
+    )
+    waited_s = 0
+
+    while waited_s < max_wait_s:
+        time.sleep(poll_interval_s)
+        waited_s += poll_interval_s
+        status = trainer._fetch_status(force=True)
+        current_epoch = trainer._extract_epoch_number(status)
+        current_remaining_s = trainer._extract_epoch_remaining_seconds(status)
+
+        if start_epoch is not None and current_epoch is not None and current_epoch != start_epoch:
+            _plan_b_log(
+                f"Detected epoch rollover: {start_epoch} -> {current_epoch} after {waited_s}s"
+            )
+            return True
+
+        if (
+            start_epoch is None
+            and start_remaining_s is not None
+            and current_remaining_s is not None
+            and current_remaining_s > (start_remaining_s + SUBMIT_WINDOW_S)
+        ):
+            _plan_b_log(
+                f"Inferred epoch rollover from remaining_s reset: {start_remaining_s:.1f}s -> "
+                f"{current_remaining_s:.1f}s after {waited_s}s"
+            )
+            return True
+
+        if waited_s % 60 == 0:
+            _plan_b_log(
+                f"Still waiting for epoch rollover after zero-shard epoch: "
+                f"start_epoch={start_epoch}, current_epoch={current_epoch}, "
+                f"start_remaining_s={start_remaining_s}, current_remaining_s={current_remaining_s}"
+            )
+
+    _plan_b_log(
+        f"Timed out waiting for epoch rollover after zero-shard epoch: "
+        f"start_epoch={start_epoch}, start_remaining_s={start_remaining_s}, waited_s={waited_s}"
+    )
+    return False
+
+
 def run_plan_b(args: Any) -> None:
     control_plane_url = _normalize_url(args.ps_url)
     args.model_dir = Path(getattr(args, "model_dir", miner_lib.DEFAULT_MODEL_DIR))
     capabilities = miner_lib.get_hardware_info(getattr(args, "device", None))
+    if args.reward_address:
+        capabilities["reward_address"] = args.reward_address
+        _plan_b_log(f"Reward address: {args.reward_address[:12]}...")
     wallet_address = str(args.address or "").strip()
     miner_instance_id = str(args.instance_id).strip() if args.instance_id else None
     lock_fp = miner_lib.acquire_single_instance_lock(miner_instance_id)
@@ -1229,7 +1583,7 @@ def run_plan_b(args: Any) -> None:
             data_plane_url = str(route_info.get("base_url") or control_plane_url)
             miner_lib.log_runtime_route(route_info, control_plane_url)
             register_response = miner_lib.register_miner_with_retry(
-                data_plane_url,
+                control_plane_url,
                 wallet_address,
                 miner_instance_id,
                 capabilities,
@@ -1251,11 +1605,14 @@ def run_plan_b(args: Any) -> None:
                     runtime_miner_id,
                     capabilities,
                     register_token,
+                    control_plane_url=control_plane_url,
+                    instance_id=miner_instance_id,
                 )
             else:
                 miner_lib._update_runtime_auth_state(
                     runtime_session,
                     data_plane_url=data_plane_url,
+                    control_plane_url=control_plane_url,
                     miner_id=runtime_miner_id,
                     capabilities=capabilities,
                     auth_token=register_token,
@@ -1270,6 +1627,7 @@ def run_plan_b(args: Any) -> None:
                 aggregator_url=data_plane_url,
                 miner_address=wallet_address,
                 auth=runtime_session.auth,
+                capabilities=capabilities,
                 args=args,
                 miner_instance_id=miner_instance_id,
             )
@@ -1281,6 +1639,7 @@ def run_plan_b(args: Any) -> None:
             heartbeat_stop, heartbeat_re_register, _thread = miner_lib.start_heartbeat_loop(
                 runtime_session,
             )
+            consecutive_zero_shard_epochs = 0
 
             while True:
                 if heartbeat_re_register is not None and heartbeat_re_register.is_set():
@@ -1302,7 +1661,7 @@ def run_plan_b(args: Any) -> None:
                         needs_re_registration = True
                         break
                     task, status = miner_lib.request_task_with_retry(
-                        runtime_session.data_plane_url,
+                        runtime_session.control_plane_url,
                         runtime_session.miner_id,
                         capabilities,
                         auth_token=runtime_session.token,
@@ -1318,10 +1677,12 @@ def run_plan_b(args: Any) -> None:
                         break
 
                     trainer.update_task_batch_size(task)
+                    trainer.update_task_context(task)
                     shard_id = task.get("shard_id")
-                    _plan_b_log(f"Downloading shard {shard_id}")
+                    shard_download_url = runtime_session.control_plane_url or runtime_session.data_plane_url
+                    _plan_b_log(f"Downloading shard {shard_id} via {shard_download_url}")
                     shard_data = miner_lib.download_shard_streaming(
-                        runtime_session.data_plane_url,
+                        shard_download_url,
                         int(shard_id),
                         auth_token=runtime_session.token,
                     )
@@ -1350,10 +1711,21 @@ def run_plan_b(args: Any) -> None:
                     break
 
                 if completed_shards == 0:
-                    _plan_b_log("Zero shards trained this epoch, skipping param_diff submission")
-                    wait_for_next_epoch(trainer)
+                    consecutive_zero_shard_epochs += 1
+                    _plan_b_log(
+                        "Zero shards trained this epoch, waiting for real epoch rollover "
+                        f"(consecutive_zero_shard_epochs={consecutive_zero_shard_epochs})"
+                    )
+                    rolled_over = wait_for_epoch_rollover(trainer)
+                    if not rolled_over or consecutive_zero_shard_epochs >= ZERO_SHARD_REREGISTER_THRESHOLD:
+                        _plan_b_log(
+                            "Zero-shard recovery stalled; forcing re-registration "
+                            f"(rolled_over={rolled_over}, consecutive_zero_shard_epochs={consecutive_zero_shard_epochs})"
+                        )
+                        break
                     continue
 
+                consecutive_zero_shard_epochs = 0
                 metadata = trainer.compute_and_compress_param_diff()
                 metadata["completed_shards"] = completed_shards
                 metadata["batch_size"] = int(
@@ -1374,7 +1746,7 @@ def run_plan_b(args: Any) -> None:
                     _plan_b_log("Param diff upload failed, re-registering and retrying once")
                     try:
                         register_response = miner_lib.register_miner_with_retry(
-                            runtime_session.data_plane_url,
+                            runtime_session.control_plane_url,
                             wallet_address,
                             miner_instance_id,
                             capabilities,
@@ -1397,6 +1769,7 @@ def run_plan_b(args: Any) -> None:
                             miner_lib._update_runtime_auth_state(
                                 runtime_session,
                                 data_plane_url=runtime_session.data_plane_url,
+                                control_plane_url=runtime_session.control_plane_url,
                                 miner_id=runtime_miner_id,
                                 capabilities=capabilities,
                                 auth_token=new_token,
