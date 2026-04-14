@@ -116,10 +116,9 @@ def _parse_url_candidates(raw_value: Any) -> List[str]:
 
 MODEL_MIRRORS = [
     "https://huggingface.co/v102ss/alice-7b-model/resolve/main",
-    "https://dl.aliceprotocol.org/models",
 ]
 EPOCH_UPDATE_MIRRORS = [
-    "https://dl.aliceprotocol.org/epoch_updates",
+    "https://huggingface.co/v102ss/alice-7b-model/resolve/main",
 ]
 
 
