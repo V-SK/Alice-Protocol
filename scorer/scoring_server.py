@@ -451,12 +451,13 @@ def score_gradient(
     sparse_gradient: Dict[str, dict],
     validation_shards: list,
     device: str,
+    learning_rate: float,
 ) -> Tuple[float, float, float]:
     """
     Score a sparse gradient against the validation set.
     
     1. Compute loss_before on validation data
-    2. Apply sparse gradient to model (in-place)
+    2. Apply sparse gradient to model (in-place, matching PS update direction)
     3. Compute loss_after
     4. Restore model to original state (exact reversal)
     5. Return (score, loss_before, loss_after)
@@ -491,20 +492,30 @@ def score_gradient(
             # Save originals for exact restoration
             saved_originals[name] = flat[indices].clone()
 
-            # Apply gradient (subtract = gradient descent direction)
-            # Note: the convention depends on how miners compute gradients.
-            # If miner sends raw gradients, PS subtracts: param -= lr * gradient
-            # If miner sends deltas (already scaled), PS adds: param += delta
-            # Match whatever PS currently does in _score_gradient_sparse()
-            flat[indices] += values
+            # Miner submissions are sparse gradients. Match PS scoring/update semantics:
+            # param := param - learning_rate * gradient
+            current_fp32 = flat[indices].float()
+            updated_fp32 = current_fp32 - (float(learning_rate) * values.float())
+            updated_cast = updated_fp32.to(flat.dtype)
 
             # FP16 nextafter nudge: if value didn't change due to precision,
             # nudge by one ULP to ensure the model actually changes
-            unchanged = flat[indices] == saved_originals[name]
+            unchanged = updated_cast == flat[indices]
             if unchanged.any():
-                nudge_vals = values[unchanged]
-                direction = torch.where(nudge_vals > 0, torch.ones_like(nudge_vals), -torch.ones_like(nudge_vals))
-                flat[indices[unchanged]] = torch.nextafter(flat[indices[unchanged]], flat[indices[unchanged]] + direction)
+                direction = -(float(learning_rate) * values.float())
+                toward = torch.where(
+                    direction < 0,
+                    torch.full_like(current_fp32, float("-inf")),
+                    torch.full_like(current_fp32, float("inf")),
+                )
+                nudged = torch.nextafter(
+                    flat[indices][unchanged].float(),
+                    toward[unchanged],
+                ).to(flat.dtype)
+                updated_cast = updated_cast.clone()
+                updated_cast[unchanged] = nudged
+
+            flat[indices] = updated_cast
 
         # --- Step 3: Compute loss_after ---
         loss_after = _compute_validation_loss(model, validation_shards, device)
@@ -911,11 +922,17 @@ class ScoringServer:
                 selected.append(shard)
         return selected, missing
 
-    def _score_submission_blocking(self, raw_data: bytes) -> Tuple[float, float, float]:
+    def _score_submission_blocking(self, raw_data: bytes, learning_rate: float) -> Tuple[float, float, float]:
         payload = json.loads(raw_data)
         sparse_gradient = decompress_gradients_sparse(payload)
         with self._model_lock:
-            return score_gradient(self.model, sparse_gradient, self.validation_shards, self.device)
+            return score_gradient(
+                self.model,
+                sparse_gradient,
+                self.validation_shards,
+                self.device,
+                learning_rate=float(learning_rate),
+            )
 
     def _validate_blocking(self, selected_shards: list) -> float:
         with self._model_lock:
@@ -929,6 +946,7 @@ class ScoringServer:
         {
             "submission_id": "uuid-or-hash",
             "model_version": 42,
+            "learning_rate": 0.001,
             "shard_id": 12345,
             "miner_id": "aXXX...alice-address",
             "epoch_id": 7,
@@ -951,7 +969,7 @@ class ScoringServer:
             return web.json_response({"error": "invalid JSON"}, status=400)
 
         # --- Validate required fields ---
-        required = ["submission_id", "model_version", "shard_id", "miner_id", "epoch_id", "gradient_url"]
+        required = ["submission_id", "model_version", "learning_rate", "shard_id", "miner_id", "epoch_id", "gradient_url"]
         missing = [f for f in required if f not in body]
         if missing:
             return web.json_response({"error": f"missing fields: {missing}"}, status=400)
@@ -973,6 +991,13 @@ class ScoringServer:
             # Could return error or proceed with warning
             # For Phase 1: proceed but flag it
             # return web.json_response({"error": "model_version_mismatch"}, status=409)
+
+        try:
+            learning_rate = float(body["learning_rate"])
+        except Exception:
+            return web.json_response({"error": "invalid learning_rate"}, status=400)
+        if not math.isfinite(learning_rate) or learning_rate <= 0:
+            return web.json_response({"error": "invalid learning_rate"}, status=400)
 
         # --- Busy check (single worker, one score at a time) ---
         if self.busy:
@@ -1001,6 +1026,7 @@ class ScoringServer:
             score, loss_before, loss_after = await asyncio.to_thread(
                 self._score_submission_blocking,
                 raw_data,
+                learning_rate,
             )
 
             elapsed_ms = int((time.time() - t0) * 1000)
@@ -1011,6 +1037,7 @@ class ScoringServer:
                 "loss_before": round(loss_before, 6),
                 "loss_after": round(loss_after, 6),
                 "model_version": self.model_version,
+                "learning_rate": learning_rate,
                 "elapsed_ms": elapsed_ms,
             }
 
@@ -1168,8 +1195,8 @@ class ScoringServer:
     def _apply_delta(self, delta_payload: dict, from_version: int) -> bool:
         """
         Apply compressed delta to the in-memory model.
-        delta_payload is binary_v2 compressed format (same as miner gradients).
-        Uses decompress_gradients_sparse (already in this file) then scatters to model params.
+        delta_payload is a precomputed model diff from PS /model/delta, not a miner gradient.
+        It must be applied as param += delta.
         """
         try:
             # decompress_gradients_sparse returns {name: {indices, values, shape}}
@@ -1602,12 +1629,8 @@ def main():
     log.info(f"  Endpoints: POST /score, POST /validate, GET /health, POST /reload")
 
     if args.ps_url and args.scorer_address and args.public_endpoint:
-        register_scorer_endpoint(
-            ps_url=args.ps_url,
-            scorer_address=args.scorer_address,
-            public_endpoint=args.public_endpoint,
-            model_version=resolved_model_version,
-        )
+        # Never block HTTP startup on PS registration. The background loop performs
+        # an immediate first registration attempt, then keeps the endpoint fresh.
         start_endpoint_registration_loop(
             ps_url=args.ps_url,
             scorer_address=args.scorer_address,
