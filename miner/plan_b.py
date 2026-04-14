@@ -6,14 +6,18 @@ import gc
 import io
 import json
 import os
+import base64
 import shutil
 import tempfile
 import threading
 import time
+import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import requests
 import torch
 
@@ -39,12 +43,13 @@ UPLOAD_LEASE_REFRESH_BUFFER_S = 60
 ZERO_SHARD_REREGISTER_THRESHOLD = 3
 EPOCH_ROLLOVER_WAIT_BUFFER_S = 30
 UPLOAD_CONNECT_TIMEOUT_S = 15
-UPLOAD_READ_TIMEOUT_S = 900
+UPLOAD_READ_TIMEOUT_S = max(60, int(os.environ.get("ALICE_UPLOAD_READ_TIMEOUT_S", "180") or 180))
 FINALIZE_READ_TIMEOUT_S = 180
 UPLOAD_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 UPLOAD_LAYER_MAX_RETRIES = 5
 FINALIZE_MAX_RETRIES = 4
 UPLOAD_RETRY_BASE_DELAY_S = 5
+UPLOAD_MAX_PARALLELISM = max(1, min(8, int(os.environ.get("ALICE_UPLOAD_MAX_PARALLELISM", "4") or 4)))
 
 
 def _plan_b_log(message: str) -> None:
@@ -74,6 +79,19 @@ def _response_error_summary(resp: requests.Response) -> str:
             body = f"{body[:237]}..."
         return f"HTTP {resp.status_code}: {body}"
     return f"HTTP {resp.status_code}"
+
+
+def _build_http_session(pool_size: int = 4) -> requests.Session:
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(
+        pool_connections=max(1, int(pool_size)),
+        pool_maxsize=max(1, int(pool_size)),
+        max_retries=0,
+        pool_block=True,
+    )
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
 
 
 def _coerce_version(value: Any) -> Optional[int]:
@@ -145,6 +163,34 @@ def _chunk_indices_for_apply(chunk: Dict[str, Any]) -> torch.Tensor:
     if indices.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"unsupported sparse update index dtype: {indices.dtype}")
     return indices.to(dtype=torch.long, device="cpu")
+
+
+def _chunk_values_for_apply(chunk: Dict[str, Any]) -> torch.Tensor:
+    values = chunk.get("values")
+    if not torch.is_tensor(values):
+        raise TypeError("sparse update chunk missing tensor values")
+    return values.to(dtype=torch.float32, device="cpu")
+
+
+def _decode_compact_epoch_update_chunk(chunk: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    packed = chunk.get("data")
+    if isinstance(packed, str):
+        packed = base64.b64decode(packed.encode("ascii"), validate=True)
+    elif isinstance(packed, bytearray):
+        packed = bytes(packed)
+    if not isinstance(packed, (bytes, bytearray)):
+        raise TypeError("compact sparse update chunk missing packed data")
+    raw = zlib.decompress(bytes(packed))
+    k = int(chunk.get("k", 0) or 0)
+    if k <= 0:
+        return (
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.float32),
+        )
+    value_bytes = np.dtype(np.float16).itemsize * k
+    values = torch.from_numpy(np.frombuffer(raw[:value_bytes], dtype=np.float16).copy()).to(torch.float32)
+    indices = torch.from_numpy(np.frombuffer(raw[value_bytes:], dtype=np.int32).copy()).to(torch.long)
+    return indices, values
 
 
 def _version_marker_path() -> Path:
@@ -244,6 +290,12 @@ class LocalTrainer:
     def _spool_dir(self, model_version: Optional[int] = None) -> Path:
         version = int(model_version if model_version is not None else self.current_model_version or 0)
         return self.param_diff_outbox_dir / f"v{version}"
+
+    def _upload_parallelism(self, layer_count: int) -> int:
+        return max(1, min(int(layer_count or 0), UPLOAD_MAX_PARALLELISM))
+
+    def _make_upload_session(self, pool_size: int) -> requests.Session:
+        return _build_http_session(pool_size=pool_size)
 
     def _spool_manifest_path(self, spool_dir: Optional[Path] = None) -> Path:
         return (spool_dir or self._spool_dir()) / "manifest.json"
@@ -696,27 +748,34 @@ class LocalTrainer:
             manifest["state"] = "pending_upload"
             self._write_spool_manifest(manifest)
             return False
-        for filepath in layer_files:
+        upload_url = f"{self._runtime_data_plane_url()}/delta/upload_layer"
+        parallelism = self._upload_parallelism(len(layer_files))
+        _plan_b_log(
+            f"Uploading {len(layer_files)} param_diff layers via {parallelism} worker(s) to {upload_url}"
+        )
+        stop_event = threading.Event()
+
+        def upload_one(session: requests.Session, filepath: str) -> Dict[str, Any]:
             layer_name = Path(filepath).stem
             headers = dict(upload_headers)
             headers["X-Layer-Name"] = layer_name
             last_error: Optional[Exception] = None
-            upload_url = f"{self._runtime_data_plane_url()}/delta/upload_layer"
             for attempt in range(1, UPLOAD_LAYER_MAX_RETRIES + 1):
                 try:
                     with open(filepath, "rb") as handle:
-                        resp = requests.post(
+                        resp = session.post(
                             upload_url,
                             data=handle,
                             headers=headers,
                             timeout=(UPLOAD_CONNECT_TIMEOUT_S, UPLOAD_READ_TIMEOUT_S),
                         )
                     if resp.status_code in (401, 403, 404, 410, 501):
-                        self._archive_spool(
-                            metadata,
-                            f"upload_layer_http_{resp.status_code}_{layer_name}",
-                        )
-                        return True
+                        stop_event.set()
+                        return {
+                            "status": "archive",
+                            "layer_name": layer_name,
+                            "reason": f"upload_layer_http_{resp.status_code}_{layer_name}",
+                        }
                     if resp.status_code in UPLOAD_RETRYABLE_STATUS_CODES:
                         detail = _response_error_summary(resp)
                         last_error = RuntimeError(detail)
@@ -730,11 +789,10 @@ class LocalTrainer:
                             continue
                         raise last_error
                     resp.raise_for_status()
-                    last_error = None
-                    break
+                    return {"status": "ok", "layer_name": layer_name}
                 except requests.RequestException as exc:
                     last_error = exc
-                    if attempt < UPLOAD_LAYER_MAX_RETRIES:
+                    if attempt < UPLOAD_LAYER_MAX_RETRIES and not stop_event.is_set():
                         delay_s = _http_retry_delay_seconds(attempt)
                         _plan_b_log(
                             f"Param diff upload retry {attempt}/{UPLOAD_LAYER_MAX_RETRIES} for {layer_name}: "
@@ -746,11 +804,54 @@ class LocalTrainer:
                 except Exception as exc:
                     last_error = exc
                     break
-            if last_error is not None:
-                _plan_b_log(f"Param diff upload failed for {layer_name}: {last_error}")
-                manifest["state"] = "pending_upload"
-                self._write_spool_manifest(manifest)
-                return False
+            stop_event.set()
+            return {"status": "error", "layer_name": layer_name, "error": last_error}
+
+        def upload_batch(batch: List[str]) -> Dict[str, Any]:
+            if not batch:
+                return {"status": "ok"}
+            session = self._make_upload_session(pool_size=max(2, len(batch)))
+            try:
+                for filepath in batch:
+                    if stop_event.is_set():
+                        return {"status": "stopped"}
+                    result = upload_one(session, filepath)
+                    if result.get("status") != "ok":
+                        return result
+                return {"status": "ok"}
+            finally:
+                with contextlib.suppress(Exception):
+                    session.close()
+
+        batches = [list(layer_files[i::parallelism]) for i in range(parallelism) if layer_files[i::parallelism]]
+        archive_reason: Optional[str] = None
+        upload_error: Optional[Exception] = None
+        if parallelism == 1:
+            result = upload_batch(batches[0] if batches else [])
+            if result.get("status") == "archive":
+                archive_reason = str(result.get("reason") or "upload_archived")
+            elif result.get("status") == "error":
+                upload_error = result.get("error") if isinstance(result.get("error"), Exception) else RuntimeError(str(result.get("error")))
+        else:
+            with ThreadPoolExecutor(max_workers=parallelism, thread_name_prefix="planb-upload") as executor:
+                futures = [executor.submit(upload_batch, batch) for batch in batches]
+                for future in as_completed(futures):
+                    result = future.result()
+                    status = str(result.get("status") or "")
+                    if status == "archive" and archive_reason is None:
+                        archive_reason = str(result.get("reason") or "upload_archived")
+                    elif status == "error" and upload_error is None:
+                        err = result.get("error")
+                        upload_error = err if isinstance(err, Exception) else RuntimeError(str(err))
+        if archive_reason is not None:
+            self._archive_spool(metadata, archive_reason)
+            return True
+        if upload_error is not None:
+            layer_name = str((upload_error.args[0] if getattr(upload_error, "args", None) else "") or "")
+            _plan_b_log(f"Param diff upload failed: {upload_error}")
+            manifest["state"] = "pending_upload"
+            self._write_spool_manifest(manifest)
+            return False
 
         finalize_payload = {
             "miner_id": str(self.auth.miner_id or self.miner_address),
@@ -1082,8 +1183,11 @@ class LocalTrainer:
                     param = named_params.get(name)
                     if param is None:
                         continue
-                    indices = _chunk_indices_for_apply(chunk)
-                    values = chunk["values"].float()
+                    if "data" in chunk:
+                        indices, values = _decode_compact_epoch_update_chunk(chunk)
+                    else:
+                        indices = _chunk_indices_for_apply(chunk)
+                        values = _chunk_values_for_apply(chunk)
                     param_flat = param.data.view(-1)
                     param_flat[indices.to(param.device)] += values.to(param.device)
             else:
