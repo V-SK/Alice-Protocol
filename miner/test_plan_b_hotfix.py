@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -21,6 +22,126 @@ import plan_b
 
 
 class PlanBHotfixTests(unittest.TestCase):
+    def test_upload_parallelism_caps_by_layer_count(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+
+        with mock.patch.object(plan_b, "UPLOAD_MAX_PARALLELISM", 4):
+            self.assertEqual(trainer._upload_parallelism(0), 1)
+            self.assertEqual(trainer._upload_parallelism(1), 1)
+            self.assertEqual(trainer._upload_parallelism(3), 3)
+            self.assertEqual(trainer._upload_parallelism(9), 4)
+
+    def test_submit_param_diff_uses_parallel_upload_workers_and_finalize(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer.auth = mock.Mock(miner_id="miner-runtime")
+        trainer.miner_address = "a2miner"
+        trainer.current_model_version = 261
+        trainer._task_upload_headers = mock.Mock(return_value={"Authorization": "Bearer token"})
+        trainer._runtime_data_plane_url = mock.Mock(return_value="http://agg")
+        trainer._archive_spool = mock.Mock()
+        trainer._cleanup_spool = mock.Mock()
+        trainer._write_spool_manifest = mock.Mock()
+        uploaded_layers = []
+        uploaded_lock = threading.Lock()
+
+        class FakeResponse:
+            def __init__(self, status_code: int = 200) -> None:
+                self.status_code = status_code
+                self.text = ""
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        class FakeSession:
+            def post(self, url, data=None, headers=None, json=None, timeout=None):
+                if url.endswith("/delta/upload_layer"):
+                    with uploaded_lock:
+                        uploaded_layers.append(str(headers["X-Layer-Name"]))
+                    return FakeResponse(200)
+                if url.endswith("/delta/finalize"):
+                    return FakeResponse(200)
+                raise AssertionError(url)
+
+            def close(self) -> None:
+                return None
+
+        trainer._make_upload_session = mock.Mock(side_effect=lambda pool_size: FakeSession())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = []
+            for idx in range(5):
+                path = Path(tmpdir) / f"layer_{idx}.pt"
+                path.write_bytes(b"payload")
+                paths.append(str(path))
+            metadata = {
+                "layer_files": paths,
+                "completed_shards": 3,
+                "batch_size": 8,
+                "completed_effective_tokens": 1024,
+                "param_diff_norm": 0.25,
+                "model_version": 261,
+            }
+            with (
+                mock.patch.object(plan_b, "UPLOAD_MAX_PARALLELISM", 3),
+                mock.patch.object(plan_b.requests, "post", return_value=FakeResponse(200)),
+            ):
+                result = trainer.submit_param_diff(metadata)
+
+        self.assertTrue(result)
+        self.assertCountEqual(uploaded_layers, [f"layer_{i}" for i in range(5)])
+        self.assertEqual(trainer._make_upload_session.call_count, 3)
+        trainer._archive_spool.assert_not_called()
+        trainer._cleanup_spool.assert_called_once()
+
+    def test_submit_param_diff_archives_spool_on_terminal_upload_status(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer.auth = mock.Mock(miner_id="miner-runtime")
+        trainer.miner_address = "a2miner"
+        trainer.current_model_version = 261
+        trainer._task_upload_headers = mock.Mock(return_value={"Authorization": "Bearer token"})
+        trainer._runtime_data_plane_url = mock.Mock(return_value="http://agg")
+        trainer._archive_spool = mock.Mock()
+        trainer._cleanup_spool = mock.Mock()
+        trainer._write_spool_manifest = mock.Mock()
+
+        class FakeResponse:
+            def __init__(self, status_code: int) -> None:
+                self.status_code = status_code
+                self.text = ""
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        class FakeSession:
+            def post(self, url, data=None, headers=None, json=None, timeout=None):
+                if url.endswith("/delta/upload_layer"):
+                    return FakeResponse(410)
+                raise AssertionError(url)
+
+            def close(self) -> None:
+                return None
+
+        trainer._make_upload_session = mock.Mock(return_value=FakeSession())
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "layer_0.pt"
+            path.write_bytes(b"payload")
+            metadata = {
+                "layer_files": [str(path)],
+                "completed_shards": 1,
+                "batch_size": 4,
+                "completed_effective_tokens": 128,
+                "param_diff_norm": 0.1,
+                "model_version": 261,
+            }
+            result = trainer.submit_param_diff(metadata)
+
+        self.assertTrue(result)
+        trainer._archive_spool.assert_called_once()
+        trainer._cleanup_spool.assert_not_called()
+
     def test_preserve_high_precision_params_keeps_norm_scales_in_fp32(self) -> None:
         class ToyNorm(torch.nn.Module):
             def __init__(self) -> None:
