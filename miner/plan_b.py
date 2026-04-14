@@ -41,6 +41,7 @@ PARAM_DIFF_SPOOL_ARCHIVE_DIR = PARAM_DIFF_OUTBOX_DIR / "archived"
 UPLOAD_LEASE_REFRESH_BUFFER_S = 60
 ZERO_SHARD_REREGISTER_THRESHOLD = 3
 EPOCH_ROLLOVER_WAIT_BUFFER_S = 30
+DIRECT_PS_RETRY_DELAY_S = 15
 UPLOAD_CONNECT_TIMEOUT_S = 15
 UPLOAD_READ_TIMEOUT_S = 900
 FINALIZE_READ_TIMEOUT_S = 180
@@ -1680,6 +1681,10 @@ def wait_for_epoch_rollover(trainer: LocalTrainer, poll_interval_s: int = 15) ->
     return False
 
 
+def _plan_b_requires_aggregator(route_info: Dict[str, Any]) -> bool:
+    return str(route_info.get("mode") or "").strip().lower() == "aggregator"
+
+
 def run_plan_b(args: Any) -> None:
     control_plane_url = _normalize_url(args.ps_url)
     args.model_dir = Path(getattr(args, "model_dir", miner_lib.DEFAULT_MODEL_DIR))
@@ -1699,6 +1704,16 @@ def run_plan_b(args: Any) -> None:
     while True:
         try:
             route_info = miner_lib.resolve_runtime_route(control_plane_url)
+            if not _plan_b_requires_aggregator(route_info):
+                source = str(route_info.get("source") or "unknown").strip() or "unknown"
+                reason = str(route_info.get("reason") or "aggregator_unavailable").strip() or "aggregator_unavailable"
+                data_plane_url = str(route_info.get("base_url") or control_plane_url)
+                _plan_b_log(
+                    "Aggregator unavailable for Plan B; refusing direct PS training. "
+                    f"source={source} reason={reason} endpoint={data_plane_url}"
+                )
+                time.sleep(DIRECT_PS_RETRY_DELAY_S)
+                continue
             data_plane_url = str(route_info.get("base_url") or control_plane_url)
             miner_lib.log_runtime_route(route_info, control_plane_url)
             register_response = miner_lib.register_miner_with_retry(
