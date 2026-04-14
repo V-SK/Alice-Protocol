@@ -6,14 +6,17 @@ import gc
 import io
 import json
 import os
+import base64
 import shutil
 import tempfile
 import threading
 import time
+import zlib
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import requests
 import torch
 
@@ -145,6 +148,34 @@ def _chunk_indices_for_apply(chunk: Dict[str, Any]) -> torch.Tensor:
     if indices.dtype not in (torch.int32, torch.int64):
         raise TypeError(f"unsupported sparse update index dtype: {indices.dtype}")
     return indices.to(dtype=torch.long, device="cpu")
+
+
+def _chunk_values_for_apply(chunk: Dict[str, Any]) -> torch.Tensor:
+    values = chunk.get("values")
+    if not torch.is_tensor(values):
+        raise TypeError("sparse update chunk missing tensor values")
+    return values.to(dtype=torch.float32, device="cpu")
+
+
+def _decode_compact_epoch_update_chunk(chunk: Dict[str, Any]) -> Tuple[torch.Tensor, torch.Tensor]:
+    packed = chunk.get("data")
+    if isinstance(packed, str):
+        packed = base64.b64decode(packed.encode("ascii"), validate=True)
+    elif isinstance(packed, bytearray):
+        packed = bytes(packed)
+    if not isinstance(packed, (bytes, bytearray)):
+        raise TypeError("compact sparse update chunk missing packed data")
+    raw = zlib.decompress(bytes(packed))
+    k = int(chunk.get("k", 0) or 0)
+    if k <= 0:
+        return (
+            torch.empty(0, dtype=torch.long),
+            torch.empty(0, dtype=torch.float32),
+        )
+    value_bytes = np.dtype(np.float16).itemsize * k
+    values = torch.from_numpy(np.frombuffer(raw[:value_bytes], dtype=np.float16).copy()).to(torch.float32)
+    indices = torch.from_numpy(np.frombuffer(raw[value_bytes:], dtype=np.int32).copy()).to(torch.long)
+    return indices, values
 
 
 def _version_marker_path() -> Path:
@@ -1082,8 +1113,11 @@ class LocalTrainer:
                     param = named_params.get(name)
                     if param is None:
                         continue
-                    indices = _chunk_indices_for_apply(chunk)
-                    values = chunk["values"].float()
+                    if "data" in chunk:
+                        indices, values = _decode_compact_epoch_update_chunk(chunk)
+                    else:
+                        indices = _chunk_indices_for_apply(chunk)
+                        values = _chunk_values_for_apply(chunk)
                     param_flat = param.data.view(-1)
                     param_flat[indices.to(param.device)] += values.to(param.device)
             else:
