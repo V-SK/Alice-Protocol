@@ -15,3 +15,5 @@ data/
 *.db
 *.jsonl
 
+# Added by D3-B 2026-04-18 cleanup
+.scratch/

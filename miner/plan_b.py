@@ -130,8 +130,9 @@ def _parse_url_candidates(raw_value: Any) -> List[str]:
 
 
 MODEL_MIRRORS = [
-    "https://huggingface.co/v102ss/alice-7b-model/resolve/main",
+    "https://ps.aliceprotocol.org/models",
     "https://dl.aliceprotocol.org/models",
+    "https://huggingface.co/v102ss/alice-7b-model/resolve/main",
 ]
 EPOCH_UPDATE_MIRRORS = [
     "https://dl.aliceprotocol.org/epoch_updates",
@@ -306,6 +307,11 @@ class LocalTrainer:
             Path(str(path)).name
             for path in (manifest.get("layer_files") or [])
         ]
+        task_context = self._serialized_task_context(manifest.get("task_context"))
+        if task_context is not None:
+            serializable["task_context"] = task_context
+        else:
+            serializable.pop("task_context", None)
         manifest_path = Path(str(serializable["manifest_path"]))
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
@@ -333,7 +339,30 @@ class LocalTrainer:
         data["spool_dir"] = str(spool_dir)
         data["manifest_path"] = str(manifest_path)
         data["layer_files"] = materialized_files
+        task_context = self._serialized_task_context(data.get("task_context"))
+        if task_context is not None:
+            data["task_context"] = task_context
+        else:
+            data.pop("task_context", None)
         return data
+
+    def _serialized_task_context(self, task_context: Any = None) -> Optional[Dict[str, Any]]:
+        candidate = dict(task_context or getattr(self, "_task_context", None) or {})
+        task_id = str(candidate.get("task_id") or "").strip()
+        assignment_token = str(candidate.get("assignment_token") or "").strip()
+        assignment_epoch = candidate.get("assignment_epoch", candidate.get("epoch"))
+        if not task_id or not assignment_token or assignment_epoch is None:
+            return None
+        try:
+            normalized_epoch = int(assignment_epoch)
+        except (TypeError, ValueError):
+            return None
+        return {
+            "task_id": task_id,
+            "assignment_token": assignment_token,
+            "assignment_epoch": normalized_epoch,
+            "deadline": str(candidate.get("deadline") or "").strip(),
+        }
 
     def recover_pending_param_diff(self) -> Optional[Dict[str, Any]]:
         manifests = sorted(
@@ -347,6 +376,9 @@ class LocalTrainer:
                 continue
             if str(manifest.get("state") or "pending_upload") in {"uploaded", "abandoned"}:
                 continue
+            task_context = self._serialized_task_context(manifest.get("task_context"))
+            if task_context is not None:
+                self._task_context = dict(task_context)
             return manifest
         return None
 
@@ -722,6 +754,9 @@ class LocalTrainer:
             "completed_effective_tokens": 0,
             "batch_size": 0,
         }
+        task_context = self._serialized_task_context()
+        if task_context is not None:
+            metadata["task_context"] = task_context
         self._write_spool_manifest(metadata)
         materialized = self._read_spool_manifest(manifest_path)
         if materialized is None:
@@ -738,6 +773,10 @@ class LocalTrainer:
 
     def submit_param_diff(self, metadata: Dict[str, Any]) -> bool:
         manifest = dict(metadata)
+        task_context = self._serialized_task_context(metadata.get("task_context"))
+        if task_context is not None:
+            manifest["task_context"] = task_context
+            self._task_context = dict(task_context)
         manifest["state"] = "uploading"
         self._write_spool_manifest(manifest)
         layer_files = metadata.get("layer_files") or []
@@ -1038,18 +1077,24 @@ class LocalTrainer:
         target_version = max(_floor_candidates)
         published_full_version = _pick_first_version(
             info.get("published_full_version"),
-            info.get("version"),
-            target_version,
-        ) or target_version
+            status.get("published_full_version"),
+            status.get("published_model_version"),
+            status.get("published_model_version_file"),
+        ) or 0
         published_update_version = _pick_first_version(
             info.get("published_update_version"),
-            target_version,
-        ) or target_version
+            status.get("published_update_version"),
+            status.get("published_update_version_file"),
+        ) or 0
         if target_version > 0:
             published_full_version = max(0, min(published_full_version, target_version))
             published_update_version = max(0, min(published_update_version, target_version))
 
         full_model_base_urls = _parse_url_candidates(info.get("full_model_base_urls"))
+        if not full_model_base_urls:
+            full_model_base_urls = _parse_url_candidates(info.get("base_urls"))
+        if not full_model_base_urls:
+            full_model_base_urls = _parse_url_candidates(info.get("base_url"))
         if not full_model_base_urls:
             full_model_base_urls = list(MODEL_MIRRORS)
 
@@ -1100,8 +1145,10 @@ class LocalTrainer:
                 _plan_b_log(f"[DOWNLOAD] Mirror failed: {exc}")
 
         if last_error is not None:
-            _plan_b_log("[DOWNLOAD] All mirrors failed, falling back to PS /model")
-        self._download_full_model_direct(version, model_path)
+            raise RuntimeError(
+                f"[PLAN-B] All full-model mirrors failed for version {version}: {last_error}"
+            ) from last_error
+        raise RuntimeError(f"[PLAN-B] No full-model mirrors configured for version {version}")
 
     def _load_epoch_update_from_path(self, path: Path) -> Dict[str, Any]:
         return torch.load(path, map_location="cpu", weights_only=True)
@@ -1414,11 +1461,23 @@ class LocalTrainer:
         if self.model is None or self.current_model_version is None:
             local_version = self._find_best_local_model(target_version)
             if local_version is None:
+                if bootstrap_version <= 0:
+                    _plan_b_log(
+                        f"No published full model available yet: live=v{target_version}, "
+                        f"published_full=v{bootstrap_version}, published_update=v{published_update_version}"
+                    )
+                    return
                 full_version = self._select_full_download_version(target_version, bootstrap_version)
                 self.download_full_model(full_version, mirror_urls=full_model_base_urls)
                 return
             initial_gap = target_version - local_version
             if initial_gap > MAX_INCREMENTAL_CATCHUP_GAP:
+                if bootstrap_version <= local_version:
+                    _plan_b_log(
+                        f"Local v{local_version} is behind live v{target_version}, "
+                        f"but no newer published full model exists yet; waiting."
+                    )
+                    return
                 _plan_b_log(
                     f"Local v{local_version} too far behind PS v{target_version}, downloading fresh model"
                 )
@@ -1431,20 +1490,45 @@ class LocalTrainer:
             self.download_full_model(version=local_version)
         if target_version is None or target_version <= self.current_model_version:
             return
+        newest_published_version = max(0, published_update_version, bootstrap_version)
+        if newest_published_version <= int(self.current_model_version or 0):
+            _plan_b_log(
+                f"Live version v{target_version} is ahead of published artifacts; "
+                f"local=v{self.current_model_version}, published_full=v{bootstrap_version}, "
+                f"published_update=v{published_update_version}. Waiting."
+            )
+            return
         available_update_version = min(target_version, max(0, published_update_version))
         if self.current_model_version > available_update_version:
+            if bootstrap_version <= int(self.current_model_version or 0):
+                _plan_b_log(
+                    f"Local v{self.current_model_version} is ahead of published updates v{available_update_version}, "
+                    f"but no newer published full model exists yet; waiting."
+                )
+                return
             _plan_b_log(
                 f"Local v{self.current_model_version} is ahead of published updates v{available_update_version}; downloading fresh full model"
             )
-            full_version = self._select_full_download_version(target_version, bootstrap_version)
+            full_version = self._select_full_download_version(
+                min(target_version, bootstrap_version),
+                bootstrap_version,
+            )
             self.download_full_model(full_version, mirror_urls=full_model_base_urls)
             return
         gap = available_update_version - self.current_model_version
         if gap > MAX_INCREMENTAL_CATCHUP_GAP:
+            if bootstrap_version <= int(self.current_model_version or 0):
+                _plan_b_log(
+                    f"Published updates stop at v{available_update_version} and no newer published full model exists; waiting."
+                )
+                return
             _plan_b_log(
                 f"Local v{self.current_model_version} too far behind published updates v{available_update_version}, downloading fresh model"
             )
-            full_version = self._select_full_download_version(target_version, bootstrap_version)
+            full_version = self._select_full_download_version(
+                min(target_version, bootstrap_version),
+                bootstrap_version,
+            )
             self.download_full_model(full_version, mirror_urls=full_model_base_urls)
             return
 
@@ -1452,6 +1536,13 @@ class LocalTrainer:
             from_version = int(self.current_model_version)
             next_version = from_version + 1
             if published_update_version < next_version:
+                full_target = min(target_version, max(0, bootstrap_version))
+                if full_target < next_version:
+                    _plan_b_log(
+                        f"Delta chain gap at v{next_version}: live=v{target_version}, "
+                        f"published_full=v{bootstrap_version}, published_update=v{published_update_version}. Waiting."
+                    )
+                    return
                 # Delta chain is broken: PS published a newer full
                 # model but the delta update for next_version does
                 # not exist. This happens after cutover-class
@@ -1463,10 +1554,10 @@ class LocalTrainer:
                     f"Delta chain gap: current=v{from_version}, "
                     f"target=v{target_version}, "
                     f"published_update_version=v{published_update_version}. "
-                    f"Falling back to full-model download for v{target_version}."
+                    f"Falling back to published full-model download for v{full_target}."
                 )
                 try:
-                    self.download_full_model(version=target_version)
+                    self.download_full_model(version=full_target, mirror_urls=full_model_base_urls)
                 except Exception as exc:
                     _plan_b_log(
                         f"Full-model fallback failed: {exc}; will retry next epoch"
@@ -1759,8 +1850,8 @@ def run_plan_b(args: Any) -> None:
         capabilities["reward_address"] = args.reward_address
         _plan_b_log(f"Reward address: {args.reward_address[:12]}...")
     wallet_address = str(args.address or "").strip()
-    miner_instance_id = str(args.instance_id).strip() if args.instance_id else None
-    lock_fp = miner_lib.acquire_single_instance_lock(miner_instance_id)
+    client_instance_id = miner_lib.resolve_client_instance_id(args.instance_id, wallet_address)
+    lock_fp = miner_lib.acquire_single_instance_lock(client_instance_id)
     heartbeat_stop: Optional[Any] = None
     heartbeat_re_register: Optional[Any] = None
     runtime_session: Optional[miner_lib.RuntimeSession] = None
@@ -1775,17 +1866,20 @@ def run_plan_b(args: Any) -> None:
             register_response = miner_lib.register_miner_with_retry(
                 control_plane_url,
                 wallet_address,
-                miner_instance_id,
+                client_instance_id,
                 capabilities,
                 retry_seconds=30,
             )
-            runtime_miner_id = str(register_response.get("miner_id") or "").strip()
+            runtime_miner_id, runtime_instance_id = miner_lib.extract_runtime_identity(
+                register_response,
+                client_instance_id=client_instance_id,
+                wallet_address=wallet_address,
+            )
             if not runtime_miner_id:
                 raise RuntimeError(
                     "[PLAN-B] Registration response missing 'miner_id' field. "
                     "Aggregator must return runtime miner_id. Cannot continue."
                 )
-            miner_instance_id = str(register_response.get("instance_id") or runtime_miner_id)
             register_token = str(register_response.get("token", "")).strip()
             if not register_token:
                 raise RuntimeError("[PLAN-B] Registration returned empty auth token")
@@ -1796,7 +1890,7 @@ def run_plan_b(args: Any) -> None:
                     capabilities,
                     register_token,
                     control_plane_url=control_plane_url,
-                    instance_id=miner_instance_id,
+                    instance_id=runtime_instance_id,
                 )
             else:
                 miner_lib._update_runtime_auth_state(
@@ -1806,7 +1900,7 @@ def run_plan_b(args: Any) -> None:
                     miner_id=runtime_miner_id,
                     capabilities=capabilities,
                     auth_token=register_token,
-                    instance_id=miner_instance_id,
+                    instance_id=runtime_instance_id,
                 )
 
             device = torch.device(capabilities["device_type"])
@@ -1819,7 +1913,7 @@ def run_plan_b(args: Any) -> None:
                 auth=runtime_session.auth,
                 capabilities=capabilities,
                 args=args,
-                miner_instance_id=miner_instance_id,
+                miner_instance_id=runtime_instance_id,
             )
             if not _flush_pending_param_diff(trainer, "Found pending param_diff spool at startup"):
                 _plan_b_log("Pending param_diff upload failed at startup; re-registering before training")
@@ -1938,22 +2032,22 @@ def run_plan_b(args: Any) -> None:
                         register_response = miner_lib.register_miner_with_retry(
                             runtime_session.control_plane_url,
                             wallet_address,
-                            miner_instance_id,
+                            client_instance_id,
                             capabilities,
                             retry_seconds=10,
                         )
                         if not register_response:
                             raise RuntimeError("[PLAN-B] Re-registration returned empty response")
-                        runtime_miner_id = str(register_response.get("miner_id") or "").strip()
+                        runtime_miner_id, runtime_instance_id = miner_lib.extract_runtime_identity(
+                            register_response,
+                            client_instance_id=client_instance_id,
+                            wallet_address=wallet_address,
+                        )
                         if not runtime_miner_id:
                             raise RuntimeError(
                                 "[PLAN-B] Registration response missing 'miner_id' field. "
                                 "Aggregator must return runtime miner_id. Cannot continue."
                             )
-                        miner_instance_id = str(
-                            register_response.get("instance_id")
-                            or runtime_miner_id
-                        )
                         new_token = str(register_response.get("token", "")).strip()
                         if new_token:
                             miner_lib._update_runtime_auth_state(
@@ -1963,7 +2057,7 @@ def run_plan_b(args: Any) -> None:
                                 miner_id=runtime_miner_id,
                                 capabilities=capabilities,
                                 auth_token=new_token,
-                                instance_id=miner_instance_id,
+                                instance_id=runtime_instance_id,
                             )
                             success = trainer.submit_param_diff(metadata)
                             if success:

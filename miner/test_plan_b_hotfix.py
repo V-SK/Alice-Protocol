@@ -7,6 +7,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import json
 from pathlib import Path
 from unittest import mock
 
@@ -142,6 +143,66 @@ class PlanBHotfixTests(unittest.TestCase):
         trainer._archive_spool.assert_called_once()
         trainer._cleanup_spool.assert_not_called()
 
+    def test_spool_manifest_round_trips_task_context(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer._task_context = {
+            "task_id": "task-123",
+            "assignment_token": "lease-abc",
+            "assignment_epoch": 284,
+            "deadline": "2026-04-16T04:00:00Z",
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spool_dir = Path(tmpdir) / "v284"
+            spool_dir.mkdir(parents=True, exist_ok=True)
+            layer_path = spool_dir / "layer_0.pt"
+            layer_path.write_bytes(b"payload")
+            manifest = {
+                "manifest_path": str(spool_dir / "manifest.json"),
+                "layer_files": [str(layer_path)],
+                "task_context": dict(trainer._task_context),
+            }
+            trainer._write_spool_manifest(manifest)
+            loaded = trainer._read_spool_manifest(spool_dir / "manifest.json")
+
+        assert loaded is not None
+        self.assertEqual(loaded["task_context"]["task_id"], "task-123")
+        self.assertEqual(loaded["task_context"]["assignment_token"], "lease-abc")
+        self.assertEqual(loaded["task_context"]["assignment_epoch"], 284)
+
+    def test_recover_pending_param_diff_restores_task_context(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer._task_context = None
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trainer.param_diff_outbox_dir = Path(tmpdir)
+            spool_dir = trainer.param_diff_outbox_dir / "v284"
+            spool_dir.mkdir(parents=True, exist_ok=True)
+            layer_path = spool_dir / "layer_0.pt"
+            layer_path.write_bytes(b"payload")
+            manifest_path = spool_dir / "manifest.json"
+            manifest_path.write_text(
+                json.dumps(
+                    {
+                        "state": "pending_upload",
+                        "layer_files": [layer_path.name],
+                        "task_context": {
+                            "task_id": "task-restore",
+                            "assignment_token": "lease-restore",
+                            "assignment_epoch": 284,
+                            "deadline": "2026-04-16T04:00:00Z",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            recovered = trainer.recover_pending_param_diff()
+
+        assert recovered is not None
+        self.assertEqual(trainer._task_context["task_id"], "task-restore")
+        self.assertEqual(trainer._task_context["assignment_token"], "lease-restore")
+
     def test_preserve_high_precision_params_keeps_norm_scales_in_fp32(self) -> None:
         class ToyNorm(torch.nn.Module):
             def __init__(self) -> None:
@@ -230,6 +291,61 @@ class PlanBHotfixTests(unittest.TestCase):
             149,
             mirror_urls=["https://dl.aliceprotocol.org/models"],
         )
+        trainer._download_epoch_update_from_mirrors.assert_not_called()
+        trainer._download_epoch_update_from_ps.assert_not_called()
+
+    def test_publication_state_uses_status_published_versions_when_model_info_omits_them(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer.current_model_version = 284
+        trainer._fetch_status = mock.Mock(
+            return_value={
+                "model_version": 285,
+                "published_model_version": 284,
+                "published_update_version_file": 284,
+            }
+        )
+        trainer._fetch_model_info = mock.Mock(
+            return_value={
+                "version": 284,
+                "base_urls": ["https://huggingface.example/models"],
+            }
+        )
+
+        publication = trainer._publication_state(force=True)
+
+        self.assertEqual(publication["target_version"], 285)
+        self.assertEqual(publication["published_full_version"], 284)
+        self.assertEqual(publication["published_update_version"], 284)
+        self.assertEqual(
+            publication["full_model_base_urls"],
+            ["https://huggingface.example/models"],
+        )
+        self.assertEqual(
+            publication["epoch_update_base_urls"],
+            ["https://dl.aliceprotocol.org/epoch_updates"],
+        )
+
+    def test_apply_epoch_updates_waits_when_live_ahead_of_published_artifacts(self) -> None:
+        trainer = plan_b.LocalTrainer.__new__(plan_b.LocalTrainer)
+        trainer.model = object()
+        trainer.current_model_version = 284
+        trainer._publication_state = mock.Mock(
+            return_value={
+                "target_version": 285,
+                "bootstrap_version": 284,
+                "published_full_version": 284,
+                "published_update_version": 284,
+                "full_model_base_urls": ["https://dl.aliceprotocol.org/models"],
+                "epoch_update_base_urls": ["https://dl.aliceprotocol.org/epoch_updates"],
+            }
+        )
+        trainer.download_full_model = mock.Mock()
+        trainer._download_epoch_update_from_mirrors = mock.Mock()
+        trainer._download_epoch_update_from_ps = mock.Mock()
+
+        trainer.apply_epoch_updates()
+
+        trainer.download_full_model.assert_not_called()
         trainer._download_epoch_update_from_mirrors.assert_not_called()
         trainer._download_epoch_update_from_ps.assert_not_called()
 

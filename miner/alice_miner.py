@@ -61,6 +61,7 @@ PIDFILE_PATH = Path.home() / ".alice" / "miner.pid"
 DEFAULT_REPORT_DIR = Path.home() / ".alice" / "reports"
 BATCH_CONFIG_PATH = Path.home() / ".alice" / "batch_config.json"
 REGISTER_BACKOFF_PATH = Path.home() / ".alice" / "register_backoff.json"
+RUNTIME_SESSION_PATH = Path.home() / ".alice" / "runtime_session.json"
 
 MAX_DELTA_HOPS = 10
 KEEP_VERSIONS = 2
@@ -854,6 +855,28 @@ def _normalize_base_url(url: str) -> str:
     return str(url or "").strip().rstrip("/")
 
 
+def resolve_client_instance_id(configured_instance_id: Optional[str], wallet_address: str) -> str:
+    configured = str(configured_instance_id or "").strip()
+    if configured:
+        return configured
+    return str(wallet_address or "").strip()
+
+
+def extract_runtime_identity(
+    response: Dict[str, Any],
+    *,
+    client_instance_id: Optional[str],
+    wallet_address: str,
+) -> Tuple[str, str]:
+    runtime_miner_id = str(response.get("miner_id") or response.get("instance_id") or "").strip()
+    runtime_instance_id = str(
+        response.get("instance_id")
+        or runtime_miner_id
+        or resolve_client_instance_id(client_instance_id, wallet_address)
+    ).strip()
+    return runtime_miner_id, runtime_instance_id
+
+
 def _probe_runtime_base(base_url: str, timeout_s: int = 5) -> bool:
     base = _normalize_base_url(base_url)
     if not base:
@@ -988,6 +1011,71 @@ def _save_register_backoff(
 def _clear_register_backoff(path: Path = REGISTER_BACKOFF_PATH) -> None:
     with contextlib.suppress(FileNotFoundError):
         path.unlink()
+
+
+def _load_runtime_session_cache(
+    control_plane_url: str,
+    path: Path = RUNTIME_SESSION_PATH,
+) -> Optional[Dict[str, Any]]:
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    if _normalize_base_url(raw.get("control_plane_url", "")) != _normalize_base_url(control_plane_url):
+        return None
+    token = str(raw.get("auth_token") or "").strip()
+    miner_id = str(raw.get("miner_id") or "").strip()
+    instance_id = str(raw.get("instance_id") or miner_id).strip()
+    if not token or not miner_id or not instance_id:
+        return None
+    return {
+        "control_plane_url": _normalize_base_url(raw.get("control_plane_url", "")),
+        "data_plane_url": _normalize_base_url(raw.get("data_plane_url", "")),
+        "auth_token": token,
+        "miner_id": miner_id,
+        "instance_id": instance_id,
+        "capabilities": dict(raw.get("capabilities") or {}),
+        "updated_at": float(raw.get("updated_at") or 0.0),
+    }
+
+
+def _save_runtime_session_cache(
+    state: Any,
+    path: Path = RUNTIME_SESSION_PATH,
+) -> None:
+    session = _coerce_runtime_session(state)
+    snapshot = session.snapshot()
+    payload = {
+        "control_plane_url": _normalize_base_url(snapshot.get("control_plane_url", "")),
+        "data_plane_url": _normalize_base_url(snapshot.get("data_plane_url", "")),
+        "auth_token": str(snapshot.get("token") or "").strip(),
+        "miner_id": str(snapshot.get("miner_id") or "").strip(),
+        "instance_id": str(snapshot.get("instance_id") or "").strip(),
+        "capabilities": dict(snapshot.get("capabilities") or {}),
+        "updated_at": time.time(),
+    }
+    if not payload["auth_token"] or not payload["miner_id"] or not payload["instance_id"]:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    tmp_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    os.replace(tmp_path, path)
+
+
+def _clear_runtime_session_cache(
+    control_plane_url: Optional[str] = None,
+    path: Path = RUNTIME_SESSION_PATH,
+) -> None:
+    if control_plane_url is None:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
+        return
+    cached = _load_runtime_session_cache(control_plane_url, path=path)
+    if cached is not None:
+        with contextlib.suppress(FileNotFoundError):
+            path.unlink()
 
 
 def resolve_runtime_route(
@@ -1143,7 +1231,11 @@ def register_miner(
             print(f"❌ Registration failed: token missing in response {data}")
             return None, None, "token_missing"
 
-        reg_instance_id = str(data.get("instance_id") or data.get("miner_id") or instance_id or wallet_address)
+        _, reg_instance_id = extract_runtime_identity(
+            data,
+            client_instance_id=instance_id,
+            wallet_address=wallet_address,
+        )
         print(
             f"✅ Registered with control plane: {normalized_endpoint} "
             f"address={wallet_address[:12]}... instance_id={reg_instance_id}"
@@ -1157,6 +1249,66 @@ def register_miner(
     except Exception as e:
         print(f"❌ Registration error via {_normalize_base_url(endpoint_url)}: {e}")
         return None, None, "exception"
+
+
+def recover_miner_session(
+    control_plane_url: str,
+    cached_session: Dict[str, Any],
+    capabilities: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], str]:
+    normalized_endpoint = _normalize_base_url(control_plane_url)
+    token = str(cached_session.get("auth_token") or "").strip()
+    miner_id = str(cached_session.get("miner_id") or "").strip()
+    instance_id = str(cached_session.get("instance_id") or miner_id).strip()
+    if not token or not miner_id or not instance_id:
+        return None, "missing_cached_session"
+
+    payload = {
+        "miner_id": miner_id,
+        "instance_id": instance_id,
+        "client_version": MINER_CLIENT_VERSION,
+        "capabilities": capabilities,
+    }
+    try:
+        resp = requests.post(
+            f"{normalized_endpoint}/recover",
+            json=payload,
+            headers=_auth_headers(token),
+            timeout=10,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            next_token = str(data.get("token") or token).strip()
+            next_miner_id = str(data.get("miner_id") or miner_id).strip()
+            next_instance_id = str(data.get("instance_id") or next_miner_id or instance_id).strip()
+            if not next_token or not next_miner_id or not next_instance_id:
+                print(f"❌ Recover failed via {normalized_endpoint}: malformed response {data}")
+                return None, "invalid_recover_payload"
+            print(
+                f"🔐 Recovered existing session via {normalized_endpoint} "
+                f"instance_id={next_instance_id}"
+            )
+            data["token"] = next_token
+            data["miner_id"] = next_miner_id
+            data["instance_id"] = next_instance_id
+            return data, "ok"
+        if resp.status_code in (401, 403):
+            print(f"⚠️ Cached session rejected via {normalized_endpoint}: {resp.status_code}")
+            return None, "invalid_session"
+        if resp.status_code == 429:
+            retry_after_s = _extract_retry_after_seconds(resp)
+            if retry_after_s is not None:
+                print(
+                    f"⏳ Recover throttled by {normalized_endpoint}; "
+                    f"sleeping {retry_after_s}s before fallback"
+                )
+                time.sleep(retry_after_s)
+            return None, "throttled"
+        print(f"❌ Recover failed via {normalized_endpoint}: {resp.status_code} {resp.text}")
+        return None, f"http_{resp.status_code}"
+    except Exception as exc:
+        print(f"❌ Recover error via {normalized_endpoint}: {exc}")
+        return None, "exception"
 
 
 def setup_tiered_training(model: nn.Module, assigned_layers: List[int], n_layers: int = 32):
@@ -2071,7 +2223,7 @@ def request_task_detailed(
         (task, status) where status is one of:
         - "ok": task available
         - "no_task": PS has no task currently
-        - "re_register": auth/session is no longer valid
+        - "auth_error": auth/session needs recovery or re-registration
         - "failed": request/network error
     """
     try:
@@ -2111,7 +2263,7 @@ def request_task_detailed(
 
         if resp.status_code in (401, 403):
             print(f"⚠️ Runtime auth rejected on task request: {resp.status_code}")
-            return None, "re_register"
+            return None, "auth_error"
 
         print(f"❌ Task request failed: {resp.status_code} {resp.text}")
         return None, "failed"
@@ -2138,7 +2290,7 @@ def send_heartbeat(
         if resp.status_code == 200:
             return "ok"
         if resp.status_code in (401, 403):
-            return "re_register"
+            return "auth_error"
         return "failed"
     except Exception:
         return "failed"
@@ -2217,14 +2369,50 @@ def _read_runtime_auth_state(state: Any) -> Dict[str, Any]:
     }
 
 
+def recover_runtime_session(state: Any) -> bool:
+    session = _coerce_runtime_session(state)
+    snapshot = _read_runtime_auth_state(session)
+    recovered, recover_status = recover_miner_session(
+        snapshot["control_plane_url"],
+        {
+            "auth_token": snapshot["auth_token"],
+            "miner_id": snapshot["miner_id"],
+            "instance_id": snapshot["instance_id"],
+            "data_plane_url": snapshot["data_plane_url"],
+            "control_plane_url": snapshot["control_plane_url"],
+        },
+        snapshot["capabilities"],
+    )
+    if not recovered:
+        if recover_status == "invalid_session":
+            _clear_runtime_session_cache(snapshot["control_plane_url"])
+        return False
+    _update_runtime_auth_state(
+        session,
+        data_plane_url=snapshot["data_plane_url"],
+        control_plane_url=snapshot["control_plane_url"],
+        miner_id=str(recovered.get("miner_id") or snapshot["miner_id"]),
+        capabilities=snapshot["capabilities"],
+        auth_token=str(recovered.get("token") or snapshot["auth_token"]),
+        instance_id=str(recovered.get("instance_id") or snapshot["instance_id"]),
+    )
+    _save_runtime_session_cache(session)
+    return True
+
+
 def send_runtime_heartbeat(state: Any) -> str:
     snapshot = _read_runtime_auth_state(state)
-    return send_heartbeat(
+    status = send_heartbeat(
         snapshot["control_plane_url"],
         snapshot["miner_id"],
         snapshot["capabilities"],
         auth_token=snapshot["auth_token"],
     )
+    if status == "auth_error":
+        if recover_runtime_session(state):
+            return "ok"
+        return "re_register"
+    return status
 
 
 def start_heartbeat_loop(
@@ -2248,8 +2436,13 @@ def start_heartbeat_loop(
                 snapshot["capabilities"],
                 auth_token=snapshot["auth_token"],
             )
-            if status == "re_register":
-                print(f"⚠️ Runtime auth rejected on heartbeat, re-registering miner...")
+            if status == "auth_error":
+                print("⚠️ Runtime auth rejected on heartbeat, attempting session recovery...")
+                if recover_runtime_session(session):
+                    consecutive_failures = 0
+                    continue
+                print("⚠️ Session recovery failed after heartbeat auth rejection, re-registering miner...")
+                _clear_runtime_session_cache(snapshot["control_plane_url"])
                 session.request_re_register()
                 return
             if status != "ok":
@@ -2259,9 +2452,8 @@ def start_heartbeat_loop(
                     f"({consecutive_failures}/{fail_threshold})"
                 )
                 if consecutive_failures >= fail_threshold:
-                    print("⚠️ Heartbeat failed repeatedly, forcing re-register")
-                    session.request_re_register()
-                    return
+                    print("⚠️ Heartbeat failed repeatedly, entering degraded mode without re-register")
+                    consecutive_failures = 0
                 continue
             consecutive_failures = 0
 
@@ -2279,6 +2471,7 @@ def request_task_with_retry(
     wallet_address: str,
     capabilities: Dict,
     auth_token: Optional[str] = None,
+    runtime_session: Optional[RuntimeSession] = None,
     retry_delay: int = 15,
     max_attempts: int = 5,
 ) -> Tuple[Optional[Dict], str]:
@@ -2289,7 +2482,8 @@ def request_task_with_retry(
         (task, status) where status is:
         - "ok": task returned
         - "no_task": currently no task
-        - "re_register": too many failures, caller should re-register
+        - "re_register": auth/session is unrecoverable, caller should re-register
+        - "failed": request/network errors exceeded retries; caller should back off but keep session
     """
     fail_count = 0
     while fail_count < max_attempts:
@@ -2303,8 +2497,11 @@ def request_task_with_retry(
             return task, "ok"
         if status == "no_task":
             return None, "no_task"
-        if status == "re_register":
-            print("⚠️ Runtime auth rejected, re-registering immediately")
+        if status == "auth_error":
+            print("⚠️ Runtime auth rejected on task request, attempting session recovery...")
+            if runtime_session is not None and recover_runtime_session(runtime_session):
+                continue
+            print("⚠️ Session recovery failed on task request, re-registering immediately")
             return None, "re_register"
 
         fail_count += 1
@@ -2312,8 +2509,8 @@ def request_task_with_retry(
             print(f"⚠️ Task request failed, retrying in {retry_delay}s... (attempt {fail_count}/{max_attempts})")
             time.sleep(retry_delay)
 
-    print("⚠️ Task request failed repeatedly, will re-register")
-    return None, "re_register"
+    print("⚠️ Task request failed repeatedly, keeping current session and backing off")
+    return None, "failed"
 
 
 def register_miner_with_retry(
@@ -3042,6 +3239,7 @@ def submit_gradient(
     gradient_data: Dict,
     metrics: Dict,
     auth_token: Optional[str] = None,
+    runtime_session: Optional[RuntimeSession] = None,
 ) -> str:
     """Submit compressed gradient to PS with retry for transient failures."""
     submit_started_at = time.time()
@@ -3091,6 +3289,9 @@ def submit_gradient(
 
             if resp.status_code in (401, 403):
                 print(f"⚠️ Runtime auth rejected on gradient submit: {resp.status_code}")
+                if runtime_session is not None and recover_runtime_session(runtime_session):
+                    auth_token = runtime_session.token
+                    continue
                 return "re_register"
 
             # Other 4xx usually means semantic rejection; no retry.
@@ -3249,10 +3450,10 @@ def run_plan_a(args: argparse.Namespace) -> None:
     if not wallet_address.startswith("a"):
         print("[ERROR] --address must look like an Alice address (prefix 'a')")
         sys.exit(1)
-    miner_instance_id = str(args.instance_id).strip() if args.instance_id else None
+    client_instance_id = resolve_client_instance_id(args.instance_id, wallet_address)
 
     # Hold process-wide non-blocking file lock to prevent duplicate miners.
-    _lock_fp = acquire_single_instance_lock(miner_instance_id)
+    _lock_fp = acquire_single_instance_lock(client_instance_id)
 
     # Persistent runtime stats for uptime logging.
     miner_start_time = time.time()
@@ -3304,21 +3505,36 @@ def run_plan_a(args: argparse.Namespace) -> None:
                 capabilities["reward_address"] = args.reward_address
                 print(f"💰 Reward address: {args.reward_address[:12]}...")
 
+            register_response: Optional[Dict[str, Any]] = None
+            cached_session = _load_runtime_session_cache(control_plane_url)
+            if cached_session is not None:
+                register_response, recover_status = recover_miner_session(
+                    control_plane_url,
+                    cached_session,
+                    capabilities,
+                )
+                if register_response is None and recover_status == "invalid_session":
+                    _clear_runtime_session_cache(control_plane_url)
+
             # Keep register/task on PS until the backend issues task-valid
             # tokens from the assigned data plane as well.
-            register_response = register_miner_with_retry(
-                control_plane_url,
-                wallet_address,
-                miner_instance_id,
-                capabilities,
-                retry_seconds=30,
+            if register_response is None:
+                register_response = register_miner_with_retry(
+                    control_plane_url,
+                    wallet_address,
+                    client_instance_id,
+                    capabilities,
+                    retry_seconds=30,
+                )
+            runtime_miner_id, runtime_instance_id = extract_runtime_identity(
+                register_response,
+                client_instance_id=client_instance_id,
+                wallet_address=wallet_address,
             )
-            runtime_miner_id = str(register_response.get("miner_id") or "").strip()
             if not runtime_miner_id:
                 print("❌ Registration response missing miner_id; retrying in 30s...")
                 time.sleep(30)
                 continue
-            miner_instance_id = str(register_response.get("instance_id") or runtime_miner_id or miner_instance_id or wallet_address)
             register_token = str(register_response.get("token", "")).strip()
             if not register_token:
                 print("❌ Runtime registration succeeded but no auth token returned; retrying in 30s...")
@@ -3331,7 +3547,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     capabilities,
                     register_token,
                     control_plane_url=control_plane_url,
-                    instance_id=miner_instance_id,
+                    instance_id=runtime_instance_id,
                 )
             else:
                 _update_runtime_auth_state(
@@ -3341,8 +3557,9 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     miner_id=runtime_miner_id,
                     capabilities=capabilities,
                     auth_token=register_token,
-                    instance_id=miner_instance_id,
+                    instance_id=runtime_instance_id,
                 )
+            _save_runtime_session_cache(runtime_session)
 
             # Use first assigned task to learn layer assignment + model version.
             print("📥 Requesting task to get layer assignment...")
@@ -3360,12 +3577,17 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     runtime_session.miner_id,
                     capabilities,
                     auth_token=runtime_session.token,
+                    runtime_session=runtime_session,
                     retry_delay=15,
                     max_attempts=5,
                 )
                 if status == "ok" and task is not None:
                     pending_task = task
                     break
+                if status == "failed":
+                    print("⚠️ Task path degraded during bootstrap, backing off without re-register...")
+                    time.sleep(15)
+                    continue
                 if status == "no_task":
                     if heartbeat_re_register is not None and heartbeat_re_register.is_set():
                         if heartbeat_stop is not None:
@@ -3393,6 +3615,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     heartbeat_status = send_runtime_heartbeat(runtime_session)
                     if heartbeat_status == "re_register":
                         print("⚠️ Runtime auth rejected during idle heartbeat, re-registering...")
+                        _clear_runtime_session_cache(control_plane_url)
                         if heartbeat_stop is not None:
                             heartbeat_stop.set()
                             heartbeat_stop = None
@@ -3411,6 +3634,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     time.sleep(10)
                     continue
                 if status == "re_register":
+                    _clear_runtime_session_cache(control_plane_url)
                     if heartbeat_stop is not None:
                         heartbeat_stop.set()
                         heartbeat_stop = None
@@ -3420,12 +3644,9 @@ def run_plan_a(args: argparse.Namespace) -> None:
             if reroute_required:
                 continue
             if pending_task is None:
-                # Could not acquire task after retries; restart registration flow.
-                print("⚠️ Could not acquire task after retries, re-registering...")
-                if heartbeat_stop is not None:
-                    heartbeat_stop.set()
-                    heartbeat_stop = None
-                heartbeat_re_register = None
+                # Bootstrap could not acquire a task yet, but keep the recovered
+                # session alive instead of thrashing register.
+                print("⚠️ Could not acquire task during bootstrap, backing off with existing session...")
                 time.sleep(30)
                 continue
 
@@ -3712,13 +3933,19 @@ def run_plan_a(args: argparse.Namespace) -> None:
                         runtime_session.miner_id,
                         capabilities,
                         auth_token=runtime_session.token,
+                        runtime_session=runtime_session,
                         retry_delay=15,
                         max_attempts=5,
                     )
+                    if status == "failed":
+                        print("⚠️ Task path degraded, backing off while keeping current session...")
+                        time.sleep(15)
+                        continue
                     if status == "no_task":
                         heartbeat_status = send_runtime_heartbeat(runtime_session)
                         if heartbeat_status == "re_register":
                             print("⚠️ Runtime auth rejected during idle heartbeat, re-registering...")
+                            _clear_runtime_session_cache(control_plane_url)
                             if heartbeat_stop is not None:
                                 heartbeat_stop.set()
                                 heartbeat_stop = None
@@ -3737,6 +3964,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                         continue
                     if status == "re_register" or task is None:
                         print("⚠️ Re-registering after repeated task request failures...")
+                        _clear_runtime_session_cache(control_plane_url)
                         if heartbeat_stop is not None:
                             heartbeat_stop.set()
                             heartbeat_stop = None
@@ -3937,6 +4165,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     compressed,
                     metrics,
                     auth_token=runtime_session.token,
+                    runtime_session=runtime_session,
                 )
                 if submit_status == "accepted":
                     gradients_accepted += 1
@@ -3989,10 +4218,11 @@ def run_plan_a(args: argparse.Namespace) -> None:
                                 register_miner_with_retry(
                                     control_plane_url,
                                     wallet_address,
-                                    miner_instance_id,
+                                    client_instance_id,
                                     retry_caps,
                                     retry_seconds=30,
                                 )
+                                _clear_runtime_session_cache(control_plane_url)
                                 os.execv(sys.executable, [sys.executable] + sys.argv)
                     print(f"✅ Task {task_id[:8]}... completed in {train_time:.1f}s\n")
                 elif submit_status == "re_register":
@@ -4000,6 +4230,7 @@ def run_plan_a(args: argparse.Namespace) -> None:
                     if current_epoch_stats is not None:
                         current_epoch_stats["gradients_rejected"] += 1
                     print("⚠️ Runtime auth rejected during submission, re-registering immediately...\n")
+                    _clear_runtime_session_cache(control_plane_url)
                     if heartbeat_stop is not None:
                         heartbeat_stop.set()
                         heartbeat_stop = None
